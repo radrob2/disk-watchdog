@@ -11,34 +11,35 @@ Adaptive disk space monitor that checks more frequently as your disk fills up, a
 
 ## Features
 
-- **Adaptive checking** - every 5 min when healthy, every 2 sec when critical
+- **Adaptive checking** - every 5 min when healthy, every 1 sec when critical
+- **eBPF-based detection** - uses `biotop` for real-time I/O monitoring (not cumulative stats)
 - **Smart writer detection** - finds and stops actual heavy disk writers, not just a predefined list
+- **Auto-calculated thresholds** - sensible defaults based on your disk size
 - **Rate detection** - warns when disk is filling rapidly (e.g., "filling at 2GB/min!")
 - **Graduated response** - warn → pause (SIGSTOP) → stop (SIGTERM) → kill (SIGKILL)
 - **SIGSTOP/SIGCONT support** - pause processes without losing work, resume when space is freed
-- **Protected processes** - never kills system-critical processes (systemd, sshd, X11, etc.)
+- **Protected processes** - comprehensive list of system-critical processes
+- **Monitors all users** - catches any runaway process, not just one user
 - **Desktop notifications** - via `notify-send`
 - **Dry-run mode** - test what would happen without killing anything
 - **Log rotation** - won't fill your disk with logs
 - **Notification rate limiting** - won't spam you with alerts
 - **Configurable** - thresholds, process patterns, mount points
-- **Lightweight** - single bash script, no dependencies beyond coreutils
+- **Auto-installs dependencies** - installer handles bpfcc-tools automatically
 
 ## Quick Install
 
 ```bash
-# Clone and install
+# One-liner install (requires root)
+curl -fsSL https://raw.githubusercontent.com/radrob/disk-watchdog/main/install.sh | sudo bash
+
+# Or manual install:
 git clone https://github.com/radrob/disk-watchdog
 cd disk-watchdog
 sudo cp disk-watchdog.sh /usr/local/bin/disk-watchdog
 sudo chmod +x /usr/local/bin/disk-watchdog
 sudo cp disk-watchdog.conf /etc/
 sudo cp disk-watchdog.service /etc/systemd/system/
-
-# Configure (REQUIRED: set your username)
-sudo nano /etc/disk-watchdog.conf
-
-# Start
 sudo systemctl daemon-reload
 sudo systemctl enable --now disk-watchdog
 ```
@@ -70,46 +71,56 @@ disk-watchdog stop
 Edit `/etc/disk-watchdog.conf`:
 
 ```bash
-# User whose processes to manage (REQUIRED!)
-DISK_WATCHDOG_USER=myusername
+# User whose processes to manage
+# Leave empty to monitor ALL users (default, recommended)
+# Set to a username to only manage that user's processes
+DISK_WATCHDOG_USER=
 
 # Mount point to monitor
 DISK_WATCHDOG_MOUNT=/
 
-# Thresholds in GB (action when free space drops below)
-DISK_WATCHDOG_THRESH_NOTICE=150   # Log only
-DISK_WATCHDOG_THRESH_WARN=100     # Desktop notification
-DISK_WATCHDOG_THRESH_HARSH=50     # Urgent warning + wall
-DISK_WATCHDOG_THRESH_PAUSE=25     # SIGSTOP - pause processes (resumable!)
-DISK_WATCHDOG_THRESH_STOP=10      # SIGTERM - graceful stop
-DISK_WATCHDOG_THRESH_KILL=5       # SIGKILL - force kill
+# Thresholds - auto-calculated by default based on disk size
+# Upper thresholds (notice/warn/harsh): percentage of disk
+# Lower thresholds (pause/stop/kill): percentage capped at safe maximums
+#
+# Auto-calculated defaults:
+#   Notice: 10% of disk
+#   Warn:   7% of disk
+#   Harsh:  4% of disk
+#   Pause:  2% of disk (max 30GB)
+#   Stop:   1% of disk (max 15GB)
+#   Kill:   0.5% of disk (max 5GB)
+#
+# Uncomment to override with fixed values:
+# DISK_WATCHDOG_THRESH_NOTICE=150
+# DISK_WATCHDOG_THRESH_PAUSE=25
 
 # Smart mode: detect actual heavy writers (recommended)
 DISK_WATCHDOG_SMART=true
 
 # Rate warning: alert if disk filling faster than X GB/min
 DISK_WATCHDOG_RATE_WARN=2
-
-# Processes to never kill
-DISK_WATCHDOG_PROTECTED="systemd|init|sshd|Xorg|cinnamon|gnome-shell"
 ```
 
 ## How It Works
 
 ### Adaptive Check Intervals
 
-| Free Space | Check Every | Why |
-|------------|-------------|-----|
-| > 150 GB   | 5 minutes   | All good, minimal overhead |
-| > 100 GB   | 1 minute    | Getting lower, pay attention |
-| > 50 GB    | 30 seconds  | Warning zone |
-| > 25 GB    | 10 seconds  | Danger zone |
-| > 10 GB    | 5 seconds   | Critical |
-| < 10 GB    | 2 seconds   | Emergency, catch it fast |
+Check frequency increases as space gets low (thresholds auto-calculated based on disk size):
 
-### Smart Writer Detection
+| Level    | Check Every | Threshold (1.7TB disk example) |
+|----------|-------------|-------------------------------|
+| OK       | 5 minutes   | > 170 GB free (10%)           |
+| Notice   | 1 minute    | > 119 GB free (7%)            |
+| Warn     | 30 seconds  | > 68 GB free (4%)             |
+| Harsh    | 10 seconds  | > 30 GB free (2%, max 30GB)   |
+| Pause    | 3 seconds   | > 15 GB free (1%, max 15GB)   |
+| Stop     | 1 second    | > 5 GB free (0.5%, max 5GB)   |
+| Kill     | 1 second    | < 5 GB free                   |
 
-Instead of killing processes based on name patterns, disk-watchdog reads `/proc/[pid]/io` to find which processes have actually written the most data. This means it will stop whatever is actually filling your disk, even if it's an unexpected process.
+### Smart Writer Detection (eBPF)
+
+disk-watchdog uses `biotop` (eBPF-based) to detect which processes are **actively writing right now**, not just cumulative write totals. This catches processes writing in bursts that would be missed by sampling `/proc/pid/io`.
 
 ```bash
 # See what it would target
@@ -127,11 +138,13 @@ Heavy disk writers (radrob):
 
 ### Graduated Response
 
-| Free Space | Signal   | Effect |
-|------------|----------|--------|
-| < 25 GB    | SIGSTOP  | **Pause** - processes freeze, can resume later |
-| < 10 GB    | SIGTERM  | **Stop** - graceful shutdown |
-| < 5 GB     | SIGKILL  | **Kill** - force kill, last resort |
+Critical thresholds are capped at safe maximums regardless of disk size:
+
+| Free Space     | Signal   | Effect |
+|----------------|----------|--------|
+| < 30 GB (max)  | SIGSTOP  | **Pause** - processes freeze, can resume later |
+| < 15 GB (max)  | SIGTERM  | **Stop** - graceful shutdown |
+| < 5 GB (max)   | SIGKILL  | **Kill** - force kill, last resort |
 
 ### Resuming Paused Processes
 

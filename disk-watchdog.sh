@@ -33,27 +33,37 @@ LOG_FILE="${DISK_WATCHDOG_LOG:-/var/log/disk-watchdog.log}"
 STATE_DIR="${DISK_WATCHDOG_STATE_DIR:-/var/lib/disk-watchdog}"
 STATE_FILE="${STATE_DIR}/state"
 RATE_FILE="${STATE_DIR}/rate"
+WRITERS_FILE="${STATE_DIR}/known_writers"
 PID_FILE="${DISK_WATCHDOG_PID:-/run/disk-watchdog.pid}"
 
-# User whose processes to manage
+# User whose processes to manage (empty = all users, which is safer for catching any runaway process)
 TARGET_USER="${DISK_WATCHDOG_USER:-}"
 
-# Thresholds in GB
-THRESH_NOTICE="${DISK_WATCHDOG_THRESH_NOTICE:-150}"
-THRESH_WARN="${DISK_WATCHDOG_THRESH_WARN:-100}"
-THRESH_HARSH="${DISK_WATCHDOG_THRESH_HARSH:-50}"
-THRESH_PAUSE="${DISK_WATCHDOG_THRESH_PAUSE:-25}"
-THRESH_STOP="${DISK_WATCHDOG_THRESH_STOP:-10}"
-THRESH_KILL="${DISK_WATCHDOG_THRESH_KILL:-5}"
+# Thresholds - can be set explicitly or auto-calculated based on disk size
+# Upper thresholds (notice/warn/harsh) scale with disk size
+# Lower thresholds (pause/stop/kill) have hard maximums for safety
+THRESH_NOTICE="${DISK_WATCHDOG_THRESH_NOTICE:-auto}"
+THRESH_WARN="${DISK_WATCHDOG_THRESH_WARN:-auto}"
+THRESH_HARSH="${DISK_WATCHDOG_THRESH_HARSH:-auto}"
+THRESH_PAUSE="${DISK_WATCHDOG_THRESH_PAUSE:-auto}"
+THRESH_STOP="${DISK_WATCHDOG_THRESH_STOP:-auto}"
+THRESH_KILL="${DISK_WATCHDOG_THRESH_KILL:-auto}"
 
-# Rate threshold: warn if losing more than X GB per minute
+# Hard maximums for critical thresholds (never go above these regardless of disk size)
+MAX_THRESH_PAUSE=30
+MAX_THRESH_STOP=15
+MAX_THRESH_KILL=5
+
+# Rate threshold: warn if losing more than X GB per minute (only when below notice threshold)
 RATE_WARN_GB_PER_MIN="${DISK_WATCHDOG_RATE_WARN:-2}"
+
+# Rate-aware escalation: if time_until_full < this many minutes, escalate one level
+RATE_ESCALATE_MINUTES="${DISK_WATCHDOG_RATE_ESCALATE:-10}"
 
 # Smart mode: detect and kill actual heavy writers (vs predefined list)
 SMART_MODE="${DISK_WATCHDOG_SMART:-true}"
 
-# Use biotop (eBPF) for real-time I/O detection if available
-USE_BIOTOP="${DISK_WATCHDOG_USE_BIOTOP:-auto}"
+# biotop command for eBPF-based I/O detection (required)
 BIOTOP_CMD="${DISK_WATCHDOG_BIOTOP_CMD:-biotop-bpfcc}"
 
 # Minimum bytes written to consider a process a "heavy writer" (default 100MB for /proc, 1MB for biotop)
@@ -63,12 +73,22 @@ BIOTOP_THRESHOLD_KB="${DISK_WATCHDOG_BIOTOP_THRESHOLD:-1024}"
 # Fallback process patterns if smart mode fails
 PROC_PATTERNS="${DISK_WATCHDOG_PROCS:-fastp|kraken|dustmasker|bwa|spades|megahit|rsync|photorec|dd|cp|mv}"
 
-# Processes to never kill (pipe-separated)
-PROTECTED_PROCS="${DISK_WATCHDOG_PROTECTED:-systemd|init|sshd|Xorg|cinnamon|gnome-shell|kde|dbus}"
+# Processes to never kill (pipe-separated regex patterns)
+# This list is comprehensive because we monitor ALL users by default
+PROTECTED_PROCS="${DISK_WATCHDOG_PROTECTED:-systemd.*|init|sshd|Xorg|Xwayland|cinnamon|gnome-shell|gnome-session|plasmashell|kde.*|dbus.*|lightdm|gdm|sddm|login|agetty|getty|polkit.*|udisks.*|NetworkManager|wpa_supplicant|dhclient|journald|rsyslogd|syslog.*|auditd|cron|atd|anacron|apt.*|dpkg|dnf|yum|pacman|packagekit.*|snapd|flatpak|pulseaudio|pipewire.*|wireplumber|bluetooth.*|cups.*|avahi.*|colord|accounts-daemon|rtkit.*|upower.*|thermald|fwupd|bolt|gvfs.*|tracker.*|evolution.*|gnome-keyring.*|ssh-agent|gpg-agent|at-spi.*|ibus.*|fcitx.*|disk-watchdog}"
 
 # Notifications
 ENABLE_DESKTOP="${DISK_WATCHDOG_DESKTOP:-true}"
 ENABLE_WALL="${DISK_WATCHDOG_WALL:-true}"
+
+# Email notifications (requires mail/sendmail)
+ENABLE_EMAIL="${DISK_WATCHDOG_EMAIL:-false}"
+EMAIL_TO="${DISK_WATCHDOG_EMAIL_TO:-}"
+EMAIL_FROM="${DISK_WATCHDOG_EMAIL_FROM:-disk-watchdog@$(hostname)}"
+
+# Webhook notifications (for Slack, Discord, ntfy.sh, etc.)
+ENABLE_WEBHOOK="${DISK_WATCHDOG_WEBHOOK:-false}"
+WEBHOOK_URL="${DISK_WATCHDOG_WEBHOOK_URL:-}"
 
 # Rate limiting: minimum seconds between notifications of same level
 NOTIFY_COOLDOWN="${DISK_WATCHDOG_NOTIFY_COOLDOWN:-300}"
@@ -78,6 +98,71 @@ DRY_RUN="${DISK_WATCHDOG_DRY_RUN:-false}"
 
 # Max log file size in bytes (default 10MB)
 MAX_LOG_SIZE="${DISK_WATCHDOG_MAX_LOG:-10485760}"
+
+# =============================================================================
+# THRESHOLD CALCULATION
+# =============================================================================
+
+# Get total disk size in GB
+get_disk_size_gb() {
+    local total_kb
+    total_kb=$(df -k "$MOUNT_POINT" 2>/dev/null | awk 'NR==2 {print $2}')
+    echo $(( total_kb / 1024 / 1024 ))
+}
+
+# Calculate thresholds based on disk size
+# Upper thresholds (notice/warn/harsh): percentage of disk
+# Lower thresholds (pause/stop/kill): percentage but capped at hard maximums
+calculate_thresholds() {
+    local disk_size
+    disk_size=$(get_disk_size_gb)
+
+    # Default percentages
+    # Notice: 10% of disk
+    # Warn: 7% of disk
+    # Harsh: 4% of disk
+    # Pause: 2% of disk (max 30GB)
+    # Stop: 1% of disk (max 15GB)
+    # Kill: 0.5% of disk (max 5GB)
+
+    if [[ "$THRESH_NOTICE" == "auto" ]]; then
+        THRESH_NOTICE=$(( disk_size * 10 / 100 ))
+        (( THRESH_NOTICE < 10 )) && THRESH_NOTICE=10  # minimum 10GB
+    fi
+
+    if [[ "$THRESH_WARN" == "auto" ]]; then
+        THRESH_WARN=$(( disk_size * 7 / 100 ))
+        (( THRESH_WARN < 5 )) && THRESH_WARN=5  # minimum 5GB
+    fi
+
+    if [[ "$THRESH_HARSH" == "auto" ]]; then
+        THRESH_HARSH=$(( disk_size * 4 / 100 ))
+        (( THRESH_HARSH < 3 )) && THRESH_HARSH=3  # minimum 3GB
+    fi
+
+    if [[ "$THRESH_PAUSE" == "auto" ]]; then
+        THRESH_PAUSE=$(( disk_size * 2 / 100 ))
+        (( THRESH_PAUSE > MAX_THRESH_PAUSE )) && THRESH_PAUSE=$MAX_THRESH_PAUSE
+        (( THRESH_PAUSE < 2 )) && THRESH_PAUSE=2  # minimum 2GB
+    fi
+
+    if [[ "$THRESH_STOP" == "auto" ]]; then
+        THRESH_STOP=$(( disk_size * 1 / 100 ))
+        (( THRESH_STOP > MAX_THRESH_STOP )) && THRESH_STOP=$MAX_THRESH_STOP
+        (( THRESH_STOP < 1 )) && THRESH_STOP=1  # minimum 1GB
+    fi
+
+    if [[ "$THRESH_KILL" == "auto" ]]; then
+        THRESH_KILL=$(( disk_size * 5 / 1000 ))  # 0.5%
+        (( THRESH_KILL > MAX_THRESH_KILL )) && THRESH_KILL=$MAX_THRESH_KILL
+        (( THRESH_KILL < 1 )) && THRESH_KILL=1  # minimum 1GB
+    fi
+}
+
+# Initialize thresholds (call this before using threshold values)
+init_thresholds() {
+    calculate_thresholds
+}
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -113,19 +198,92 @@ notify_desktop() {
     local title="$2"
     local msg="$3"
 
-    if [[ -n "$TARGET_USER" ]]; then
+    # Determine which user to notify
+    local notify_user="$TARGET_USER"
+    if [[ -z "$notify_user" ]]; then
+        # Find logged-in GUI user (first user with a display)
+        notify_user=$(who | awk '/:/ {print $1; exit}')
+    fi
+
+    if [[ -n "$notify_user" ]]; then
         # Try multiple display methods
         for display in :0 :1; do
-            su - "$TARGET_USER" -c "DISPLAY=$display notify-send -u '$urgency' '$title' '$msg'" 2>/dev/null && return 0
+            su - "$notify_user" -c "DISPLAY=$display notify-send -u '$urgency' '$title' '$msg'" 2>/dev/null && return 0
         done
         # Try without DISPLAY (wayland)
-        su - "$TARGET_USER" -c "notify-send -u '$urgency' '$title' '$msg'" 2>/dev/null || true
+        su - "$notify_user" -c "notify-send -u '$urgency' '$title' '$msg'" 2>/dev/null || true
     fi
 }
 
 notify_wall() {
     [[ "$ENABLE_WALL" != "true" ]] && return 0
     echo "$1" | wall 2>/dev/null || true
+}
+
+notify_email() {
+    [[ "$ENABLE_EMAIL" != "true" ]] && return 0
+    [[ -z "$EMAIL_TO" ]] && return 0
+
+    local subject="$1"
+    local body="$2"
+
+    # Try different mail commands
+    if command -v mail &>/dev/null; then
+        echo "$body" | mail -s "$subject" "$EMAIL_TO" 2>/dev/null || true
+    elif command -v sendmail &>/dev/null; then
+        {
+            echo "To: $EMAIL_TO"
+            echo "From: $EMAIL_FROM"
+            echo "Subject: $subject"
+            echo ""
+            echo "$body"
+        } | sendmail -t 2>/dev/null || true
+    elif command -v msmtp &>/dev/null; then
+        {
+            echo "To: $EMAIL_TO"
+            echo "From: $EMAIL_FROM"
+            echo "Subject: $subject"
+            echo ""
+            echo "$body"
+        } | msmtp "$EMAIL_TO" 2>/dev/null || true
+    else
+        log_msg "WARN" "Email enabled but no mail command found (mail/sendmail/msmtp)"
+    fi
+}
+
+notify_webhook() {
+    [[ "$ENABLE_WEBHOOK" != "true" ]] && return 0
+    [[ -z "$WEBHOOK_URL" ]] && return 0
+
+    local title="$1"
+    local msg="$2"
+    local hostname
+    hostname=$(hostname)
+
+    # Detect webhook type from URL and format accordingly
+    if [[ "$WEBHOOK_URL" == *"hooks.slack.com"* ]]; then
+        # Slack format
+        curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"*${title}* (${hostname})\n${msg}\"}" \
+            "$WEBHOOK_URL" &>/dev/null || true
+    elif [[ "$WEBHOOK_URL" == *"discord.com/api/webhooks"* ]]; then
+        # Discord format
+        curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"content\":\"**${title}** (${hostname})\n${msg}\"}" \
+            "$WEBHOOK_URL" &>/dev/null || true
+    elif [[ "$WEBHOOK_URL" == *"ntfy"* ]]; then
+        # ntfy.sh format
+        curl -s -X POST \
+            -H "Title: ${title}" \
+            -H "Priority: high" \
+            -d "${msg} (${hostname})" \
+            "$WEBHOOK_URL" &>/dev/null || true
+    else
+        # Generic POST with JSON
+        curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"title\":\"${title}\",\"message\":\"${msg}\",\"hostname\":\"${hostname}\"}" \
+            "$WEBHOOK_URL" &>/dev/null || true
+    fi
 }
 
 can_notify() {
@@ -161,25 +319,67 @@ get_free_bytes() {
 
 get_check_interval() {
     local free="$1"
-    if   (( free > THRESH_NOTICE )); then echo 300
-    elif (( free > THRESH_WARN ));   then echo 60
-    elif (( free > THRESH_HARSH ));  then echo 30
-    elif (( free > THRESH_PAUSE ));  then echo 10
-    elif (( free > THRESH_STOP ));   then echo 5
-    else                                  echo 2
+    # Adaptive intervals: more frequent as disk fills up
+    # At critical levels, check very frequently to catch rapid filling
+    if   (( free > THRESH_NOTICE )); then echo 300   # 5 min - all good
+    elif (( free > THRESH_WARN ));   then echo 60    # 1 min - getting lower
+    elif (( free > THRESH_HARSH ));  then echo 30    # 30 sec - warning zone
+    elif (( free > THRESH_PAUSE ));  then echo 10    # 10 sec - danger zone
+    elif (( free > THRESH_STOP ));   then echo 3     # 3 sec - critical
+    elif (( free > THRESH_KILL ));   then echo 1     # 1 sec - emergency
+    else                                  echo 1     # 1 sec - extreme emergency
     fi
 }
 
 get_level() {
     local free="$1"
-    if   (( free < THRESH_KILL ));   then echo "kill"
-    elif (( free < THRESH_STOP ));   then echo "stop"
-    elif (( free < THRESH_PAUSE ));  then echo "pause"
-    elif (( free < THRESH_HARSH ));  then echo "harsh"
-    elif (( free < THRESH_WARN ));   then echo "warn"
-    elif (( free < THRESH_NOTICE )); then echo "notice"
-    else                                  echo "ok"
+    local rate="${2:-0}"  # Optional: GB/min fill rate
+
+    # Base level from free space
+    local level
+    if   (( free < THRESH_KILL ));   then level="kill"
+    elif (( free < THRESH_STOP ));   then level="stop"
+    elif (( free < THRESH_PAUSE ));  then level="pause"
+    elif (( free < THRESH_HARSH ));  then level="harsh"
+    elif (( free < THRESH_WARN ));   then level="warn"
+    elif (( free < THRESH_NOTICE )); then level="notice"
+    else                                  level="ok"
     fi
+
+    # Rate-aware escalation: if we'll hit next threshold in < RATE_ESCALATE_MINUTES, escalate now
+    if (( rate > 0 && RATE_ESCALATE_MINUTES > 0 )); then
+        local minutes_to_next=999
+
+        case "$level" in
+            ok)
+                # Minutes until notice threshold
+                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_NOTICE) / rate ))
+                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="notice"
+                ;;
+            notice)
+                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_WARN) / rate ))
+                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="warn"
+                ;;
+            warn)
+                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_HARSH) / rate ))
+                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="harsh"
+                ;;
+            harsh)
+                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_PAUSE) / rate ))
+                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="pause"
+                ;;
+            pause)
+                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_STOP) / rate ))
+                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="stop"
+                ;;
+            stop)
+                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_KILL) / rate ))
+                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="kill"
+                ;;
+        esac
+    fi
+
+    echo "$level"
 }
 
 read_state() {
@@ -191,6 +391,65 @@ write_state() {
 }
 
 # =============================================================================
+# PERSISTENT HEAVY WRITER TRACKING
+# =============================================================================
+
+# Add a process to known heavy writers list
+track_writer() {
+    local pid="$1"
+    local comm="$2"
+    local bytes="$3"
+    local timestamp
+    timestamp=$(date +%s)
+
+    # Format: pid:comm:bytes:first_seen:last_seen
+    # Update if exists, add if new
+    if [[ -f "$WRITERS_FILE" ]] && grep -q "^${pid}:" "$WRITERS_FILE" 2>/dev/null; then
+        # Update existing entry (update bytes and last_seen)
+        sed -i "s/^${pid}:.*/${pid}:${comm}:${bytes}:.*:${timestamp}/" "$WRITERS_FILE" 2>/dev/null || true
+    else
+        echo "${pid}:${comm}:${bytes}:${timestamp}:${timestamp}" >> "$WRITERS_FILE" 2>/dev/null || true
+    fi
+}
+
+# Get known heavy writers that are still running
+get_tracked_writers() {
+    [[ ! -f "$WRITERS_FILE" ]] && return
+
+    while IFS=: read -r pid comm bytes first_seen last_seen; do
+        # Check if process still exists
+        if [[ -d "/proc/$pid" ]]; then
+            # Check if it's the same process (comm matches)
+            local current_comm
+            current_comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+            if [[ "$current_comm" == "$comm" ]]; then
+                echo "${bytes}:${pid}:${comm}"
+            fi
+        fi
+    done < "$WRITERS_FILE" 2>/dev/null
+}
+
+# Clean up dead processes from tracking file
+cleanup_tracked_writers() {
+    [[ ! -f "$WRITERS_FILE" ]] && return
+
+    local temp_file="${WRITERS_FILE}.tmp"
+    > "$temp_file"
+
+    while IFS=: read -r pid comm bytes first_seen last_seen; do
+        if [[ -d "/proc/$pid" ]]; then
+            local current_comm
+            current_comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+            if [[ "$current_comm" == "$comm" ]]; then
+                echo "${pid}:${comm}:${bytes}:${first_seen}:${last_seen}" >> "$temp_file"
+            fi
+        fi
+    done < "$WRITERS_FILE" 2>/dev/null
+
+    mv "$temp_file" "$WRITERS_FILE" 2>/dev/null || true
+}
+
+# =============================================================================
 # RATE DETECTION
 # =============================================================================
 
@@ -198,10 +457,11 @@ calculate_rate() {
     local current_bytes="$1"
     local current_time
     current_time=$(date +%s)
+    local gb_per_min=0
 
     if [[ -f "$RATE_FILE" ]]; then
         local prev_bytes prev_time
-        read -r prev_bytes prev_time < "$RATE_FILE" 2>/dev/null || return
+        read -r prev_bytes prev_time < "$RATE_FILE" 2>/dev/null || true
 
         if [[ -n "$prev_bytes" && -n "$prev_time" ]]; then
             local bytes_diff=$(( current_bytes - prev_bytes ))
@@ -210,18 +470,20 @@ calculate_rate() {
             if (( time_diff > 0 && bytes_diff < 0 )); then
                 # Disk is filling (free space decreased)
                 local bytes_per_sec=$(( -bytes_diff / time_diff ))
-                local gb_per_min=$(( bytes_per_sec * 60 / 1024 / 1024 / 1024 ))
-
-                if (( gb_per_min >= RATE_WARN_GB_PER_MIN )); then
-                    echo "$gb_per_min"
-                    return
-                fi
+                gb_per_min=$(( bytes_per_sec * 60 / 1024 / 1024 / 1024 ))
             fi
         fi
     fi
 
+    # Always update rate file for next calculation
     echo "$current_bytes $current_time" > "$RATE_FILE" 2>/dev/null || true
-    echo "0"
+
+    # Only report if above warning threshold
+    if (( gb_per_min >= RATE_WARN_GB_PER_MIN )); then
+        echo "$gb_per_min"
+    else
+        echo "0"
+    fi
 }
 
 # =============================================================================
@@ -255,7 +517,7 @@ get_heavy_writers_biotop() {
     # Run biotop for 1 second, get 1 sample
     # Filter: writes only (W), to our disk, above threshold
     "$BIOTOP_CMD" -C 1 1 2>/dev/null | \
-        awk -v dev="$device" -v thresh="$BIOTOP_THRESHOLD_KB" -v user="$TARGET_USER" '
+        awk -v dev="$device" -v thresh="$BIOTOP_THRESHOLD_KB" '
         NF >= 8 && $3 == "W" && $6 ~ dev && $7 >= thresh {
             pid = $1
             comm = $2
@@ -265,7 +527,23 @@ get_heavy_writers_biotop() {
                 print kbytes * 1024 ":" pid ":" comm
             }
         }
-        ' | sort -t: -k1 -rn | head -10
+        ' | while IFS=: read -r bytes pid comm; do
+            [[ -z "$pid" ]] && continue
+
+            # Filter by user if TARGET_USER is set
+            if [[ -n "$TARGET_USER" ]]; then
+                local proc_user
+                proc_user=$(stat -c %U "/proc/$pid" 2>/dev/null) || continue
+                [[ "$proc_user" != "$TARGET_USER" ]] && continue
+            fi
+
+            # Skip protected processes
+            if echo "$comm" | grep -qE "^($PROTECTED_PROCS)$"; then
+                continue
+            fi
+
+            echo "$bytes:$pid:$comm"
+        done | sort -t: -k1 -rn | head -10
 }
 
 # Get heavy writers using /proc/pid/io (fallback - cumulative, less accurate)
@@ -311,9 +589,23 @@ get_heavy_writers_proc() {
     printf '%s\n' "${writers[@]}" 2>/dev/null | sort -t: -k1 -rn | head -10
 }
 
-# Main function to get heavy writers - uses biotop (required)
+# Main function to get heavy writers - combines real-time biotop + tracked writers
 get_heavy_writers() {
-    get_heavy_writers_biotop
+    # Get current writers from biotop
+    local current_writers
+    current_writers=$(get_heavy_writers_biotop)
+
+    # Track any new writers we find
+    while IFS=: read -r bytes pid comm; do
+        [[ -z "$pid" ]] && continue
+        track_writer "$pid" "$comm" "$bytes"
+    done <<< "$current_writers"
+
+    # Merge current writers with tracked writers (in case biotop missed some)
+    {
+        echo "$current_writers"
+        get_tracked_writers
+    } | sort -t: -k1 -rn | awk -F: '!seen[$2]++' | head -10
 }
 
 format_bytes() {
@@ -410,13 +702,17 @@ action_kill() {
     local killed
     killed=$(kill_heavy_writers "-KILL" 10)
 
+    local msg
     if [[ -n "$killed" ]]; then
-        notify_desktop "critical" "DISK EMERGENCY" "${free}GB free! KILLED: $killed"
-        notify_wall "DISK EMERGENCY: ${free}GB free! KILLED: $killed"
+        msg="${free}GB free! KILLED: $killed"
     else
-        notify_desktop "critical" "DISK EMERGENCY" "${free}GB free! No heavy writers found to kill."
-        notify_wall "DISK EMERGENCY: ${free}GB free! No heavy writers found."
+        msg="${free}GB free! No heavy writers found to kill."
     fi
+
+    notify_desktop "critical" "DISK EMERGENCY" "$msg"
+    notify_wall "DISK EMERGENCY: $msg"
+    notify_email "[EMERGENCY] Disk Space Critical" "disk-watchdog emergency on $(hostname):\n\n$msg\n\nMount: $MOUNT_POINT\nTime: $(date)"
+    notify_webhook "DISK EMERGENCY" "$msg"
 }
 
 action_stop() {
@@ -427,8 +723,11 @@ action_stop() {
     stopped=$(kill_heavy_writers "-TERM" 5)
 
     if [[ -n "$stopped" ]]; then
-        notify_desktop "critical" "DISK CRITICAL" "${free}GB free! Stopped: $stopped"
-        notify_wall "DISK CRITICAL: ${free}GB free! Stopped: $stopped"
+        local msg="${free}GB free! Stopped: $stopped"
+        notify_desktop "critical" "DISK CRITICAL" "$msg"
+        notify_wall "DISK CRITICAL: $msg"
+        notify_email "[CRITICAL] Disk Space Low - Processes Stopped" "disk-watchdog critical on $(hostname):\n\n$msg\n\nMount: $MOUNT_POINT\nTime: $(date)"
+        notify_webhook "DISK CRITICAL" "$msg"
     fi
 }
 
@@ -440,8 +739,13 @@ action_pause() {
     paused=$(kill_heavy_writers "-STOP" 5)
 
     if [[ -n "$paused" ]]; then
-        notify_desktop "critical" "DISK LOW" "${free}GB free! PAUSED: $paused - Resume with: pkill -CONT ..."
-        notify_wall "DISK LOW: ${free}GB free! PAUSED: $paused - Resume with: pkill -CONT -u $TARGET_USER"
+        local resume_hint="Resume with: kill -CONT <PID>"
+        [[ -n "$TARGET_USER" ]] && resume_hint="Resume with: pkill -CONT -u $TARGET_USER"
+        local msg="${free}GB free! PAUSED: $paused"
+        notify_desktop "critical" "DISK LOW" "$msg - $resume_hint"
+        notify_wall "DISK LOW: $msg - $resume_hint"
+        notify_email "[WARNING] Disk Space Low - Processes Paused" "disk-watchdog warning on $(hostname):\n\n$msg\n\n$resume_hint\n\nMount: $MOUNT_POINT\nTime: $(date)"
+        notify_webhook "DISK LOW - Paused" "$msg"
     fi
 }
 
@@ -466,8 +770,11 @@ action_harsh_warn() {
         local rate_info=""
         (( rate > 0 )) && rate_info=" Filling at ~${rate}GB/min!"
 
-        notify_desktop "critical" "Disk Space Low" "${free}GB free.${rate_info}${writers_info}"
-        notify_wall "DISK WARNING: ${free}GB free.${rate_info}${writers_info}"
+        local msg="${free}GB free.${rate_info}${writers_info}"
+        notify_desktop "critical" "Disk Space Low" "$msg"
+        notify_wall "DISK WARNING: $msg"
+        notify_email "[WARNING] Disk Space Getting Low" "disk-watchdog warning on $(hostname):\n\n$msg\n\nMount: $MOUNT_POINT\nTime: $(date)\n\nNo action taken yet - this is an early warning."
+        notify_webhook "Disk Space Low" "$msg"
     fi
 }
 
@@ -494,6 +801,9 @@ action_recover() {
 # =============================================================================
 
 cmd_status() {
+    # Initialize thresholds based on disk size
+    init_thresholds
+
     local free
     free=$(get_free_gb) || die "Cannot read disk space for $MOUNT_POINT"
 
@@ -505,27 +815,31 @@ cmd_status() {
     local biotop_status="not found"
     has_biotop && biotop_status="$BIOTOP_CMD"
 
-    local device
+    local device disk_size
     device=$(get_mount_device "$MOUNT_POINT")
+    disk_size=$(get_disk_size_gb)
 
     echo "disk-watchdog v${VERSION}"
     echo ""
     echo "Mount point:     $MOUNT_POINT ($device)"
-    echo "Free space:      ${free}GB"
+    echo "Disk size:       ${disk_size}GB"
+    local pct=0
+    (( disk_size > 0 )) && pct=$(( free * 100 / disk_size ))
+    echo "Free space:      ${free}GB (${pct}%)"
     echo "Current level:   $level"
     echo "Saved state:     $state"
     echo "Check interval:  ${interval}s"
-    echo "Target user:     ${TARGET_USER:-any}"
+    echo "Target:          ${TARGET_USER:-all users}"
     echo "I/O detection:   $biotop_status (eBPF real-time)"
     echo "Dry run:         $DRY_RUN"
     echo ""
-    echo "Thresholds:"
-    echo "  Notice: <${THRESH_NOTICE}GB"
-    echo "  Warn:   <${THRESH_WARN}GB"
-    echo "  Harsh:  <${THRESH_HARSH}GB"
-    echo "  Pause:  <${THRESH_PAUSE}GB (SIGSTOP)"
-    echo "  Stop:   <${THRESH_STOP}GB (SIGTERM)"
-    echo "  Kill:   <${THRESH_KILL}GB (SIGKILL)"
+    echo "Thresholds (auto-calculated for ${disk_size}GB disk):"
+    echo "  Notice: <${THRESH_NOTICE}GB (10%)"
+    echo "  Warn:   <${THRESH_WARN}GB (7%)"
+    echo "  Harsh:  <${THRESH_HARSH}GB (4%)"
+    echo "  Pause:  <${THRESH_PAUSE}GB (2%, max ${MAX_THRESH_PAUSE}GB) - SIGSTOP"
+    echo "  Stop:   <${THRESH_STOP}GB (1%, max ${MAX_THRESH_STOP}GB) - SIGTERM"
+    echo "  Kill:   <${THRESH_KILL}GB (0.5%, max ${MAX_THRESH_KILL}GB) - SIGKILL"
     echo ""
     echo "Currently writing to $device (real-time via eBPF):"
 
@@ -545,6 +859,8 @@ cmd_status() {
 }
 
 cmd_check() {
+    init_thresholds
+
     local free
     free=$(get_free_gb) || die "Cannot read disk space for $MOUNT_POINT"
 
@@ -578,7 +894,101 @@ cmd_writers() {
     return 0
 }
 
+cmd_test() {
+    init_thresholds
+
+    echo "disk-watchdog test mode"
+    echo "======================="
+    echo ""
+    echo "This will test notifications at each level WITHOUT taking any action."
+    echo "No processes will be paused/stopped/killed."
+    echo ""
+
+    local test_level="${1:-all}"
+    local free
+    free=$(get_free_gb) || die "Cannot read disk space"
+
+    echo "Current free space: ${free}GB"
+    echo "Current level: $(get_level "$free" 0)"
+    echo ""
+
+    # Determine which user to notify
+    local notify_user="$TARGET_USER"
+    if [[ -z "$notify_user" ]]; then
+        notify_user=$(who | awk '/:/ {print $1; exit}')
+    fi
+    echo "Notifications will go to: ${notify_user:-nobody (no GUI user found)}"
+    echo ""
+
+    if [[ "$test_level" == "all" || "$test_level" == "notice" ]]; then
+        echo "Testing NOTICE level..."
+        notify_desktop "low" "TEST: Disk Notice" "This is a test notification (notice level)"
+        echo "  Desktop notification sent"
+    fi
+
+    if [[ "$test_level" == "all" || "$test_level" == "warn" ]]; then
+        echo "Testing WARN level..."
+        notify_desktop "normal" "TEST: Disk Warning" "This is a test notification (warn level)"
+        echo "  Desktop notification sent"
+    fi
+
+    if [[ "$test_level" == "all" || "$test_level" == "harsh" ]]; then
+        echo "Testing HARSH level..."
+        notify_desktop "critical" "TEST: Disk Space Low" "This is a test notification (harsh level)"
+        if [[ "$ENABLE_WALL" == "true" ]]; then
+            notify_wall "TEST: disk-watchdog harsh warning test"
+            echo "  Wall message sent"
+        fi
+        echo "  Desktop notification sent"
+    fi
+
+    if [[ "$test_level" == "all" || "$test_level" == "pause" ]]; then
+        echo "Testing PAUSE level..."
+        notify_desktop "critical" "TEST: DISK LOW" "This is a test (pause level) - processes would be paused"
+        notify_wall "TEST: disk-watchdog PAUSE test - no processes affected"
+        echo "  Desktop + wall sent"
+    fi
+
+    if [[ "$test_level" == "all" || "$test_level" == "critical" ]]; then
+        echo "Testing CRITICAL levels (stop/kill)..."
+        notify_desktop "critical" "TEST: DISK CRITICAL" "This is a test (stop/kill level) - processes would be stopped"
+        notify_wall "TEST: disk-watchdog CRITICAL test - no processes affected"
+        echo "  Desktop + wall sent"
+    fi
+
+    # Test email if enabled
+    if [[ "$ENABLE_EMAIL" == "true" && -n "$EMAIL_TO" ]]; then
+        echo ""
+        echo "Testing EMAIL notification to $EMAIL_TO..."
+        notify_email "[TEST] disk-watchdog" "This is a test email from disk-watchdog on $(hostname).\n\nIf you receive this, email notifications are working."
+        echo "  Email sent (check inbox)"
+    elif [[ "$ENABLE_EMAIL" == "true" ]]; then
+        echo ""
+        echo "Email enabled but EMAIL_TO not set - skipping"
+    fi
+
+    # Test webhook if enabled
+    if [[ "$ENABLE_WEBHOOK" == "true" && -n "$WEBHOOK_URL" ]]; then
+        echo ""
+        echo "Testing WEBHOOK notification..."
+        notify_webhook "TEST: disk-watchdog" "This is a test from $(hostname). If you see this, webhooks are working."
+        echo "  Webhook sent"
+    elif [[ "$ENABLE_WEBHOOK" == "true" ]]; then
+        echo ""
+        echo "Webhook enabled but WEBHOOK_URL not set - skipping"
+    fi
+
+    echo ""
+    echo "Test complete. Check your notifications."
+    echo ""
+    echo "To test what would be targeted (dry-run):"
+    echo "  sudo disk-watchdog --dry-run run"
+}
+
 cmd_run() {
+    # Initialize thresholds based on disk size
+    init_thresholds
+
     # Require biotop
     require_biotop
 
@@ -599,7 +1009,7 @@ cmd_run() {
     # Signal handlers
     trap 'log_msg "INFO" "Received SIGTERM, shutting down"; rm -f "$PID_FILE"; exit 0' SIGTERM
     trap 'log_msg "INFO" "Received SIGINT, shutting down"; rm -f "$PID_FILE"; exit 0' SIGINT
-    trap 'log_msg "INFO" "Received SIGHUP, reloading config"; [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"' SIGHUP
+    trap 'log_msg "INFO" "Received SIGHUP, reloading config"; [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"; init_thresholds' SIGHUP
 
     log_msg "INFO" "$SCRIPT_NAME v${VERSION} started (PID $$)"
     log_msg "INFO" "Config: mount=$MOUNT_POINT user=${TARGET_USER:-any} smart=$SMART_MODE dry_run=$DRY_RUN"
@@ -627,12 +1037,21 @@ cmd_run() {
         rate=$(calculate_rate "$free_bytes")
 
         local level interval
-        level=$(get_level "$free")
+        level=$(get_level "$free" "$rate")  # Pass rate for rate-aware escalation
         interval=$(get_check_interval "$free")
+
+        # Periodically clean up tracked writers (every ~5 minutes at normal interval)
+        cleanup_tracked_writers
 
         # Log rate warnings
         if (( rate > 0 )); then
             log_msg "RATE" "Disk filling at ~${rate}GB/min (${free}GB free)"
+            # Log if rate caused escalation
+            local base_level
+            base_level=$(get_level "$free" 0)
+            if [[ "$level" != "$base_level" ]]; then
+                log_msg "ESCALATE" "Rate-aware escalation: $base_level -> $level (filling too fast)"
+            fi
         fi
 
         # Take action based on level transitions
@@ -719,7 +1138,7 @@ cmd_stop() {
 
 cmd_help() {
     cat << 'EOF'
-disk-watchdog - Adaptive disk space monitor
+disk-watchdog - Adaptive disk space monitor with eBPF-based I/O detection
 
 USAGE:
     disk-watchdog [COMMAND] [OPTIONS]
@@ -727,47 +1146,48 @@ USAGE:
 COMMANDS:
     run         Start monitoring (default if no command given)
     stop        Stop the running daemon
-    status      Show current disk status and top writers
+    status      Show current disk status, thresholds, and top writers
     check       Quick check - exits 0 if OK, 1 if warning/critical
-    writers     Show top disk writers
+    writers     Show top disk writers (real-time via eBPF)
+    test        Test notifications without taking action
     help        Show this help
 
 OPTIONS:
     -c, --config FILE    Config file (default: /etc/disk-watchdog.conf)
     -m, --mount PATH     Mount point to monitor (default: /)
-    -u, --user USER      Only manage this user's processes
+    -u, --user USER      Only manage this user's processes (default: all)
     -n, --dry-run        Log actions but don't kill processes
     -v, --version        Show version
     -h, --help           Show this help
 
 QUICK START:
-    # Install and configure
+    # One-liner install
+    curl -fsSL https://raw.githubusercontent.com/.../install.sh | sudo bash
+
+    # Or manual
     sudo cp disk-watchdog.sh /usr/local/bin/disk-watchdog
-    sudo cp disk-watchdog.conf /etc/
-    sudo nano /etc/disk-watchdog.conf  # Set DISK_WATCHDOG_USER
-
-    # Test
-    disk-watchdog status
-    disk-watchdog --dry-run run
-
-    # Run as service
     sudo systemctl enable --now disk-watchdog
 
-THRESHOLDS (configurable):
-    <150GB  Notice (log only)
-    <100GB  Warning (desktop notification)
-    <50GB   Harsh warning (wall message)
-    <25GB   PAUSE processes (SIGSTOP - resumable!)
-    <10GB   STOP processes (SIGTERM)
-    <5GB    KILL processes (SIGKILL)
+    # Test
+    sudo disk-watchdog status
+    sudo disk-watchdog --dry-run run
 
-SMART MODE:
-    By default, disk-watchdog detects which processes are actually
-    writing heavily to disk and targets those, rather than using
-    a predefined list. Disable with DISK_WATCHDOG_SMART=false.
+THRESHOLDS:
+    Auto-calculated based on disk size. Critical thresholds capped:
+      Pause: 2% of disk (max 30GB) - SIGSTOP, resumable
+      Stop:  1% of disk (max 15GB) - SIGTERM
+      Kill:  0.5% of disk (max 5GB) - SIGKILL
+
+    Run 'disk-watchdog status' to see calculated values for your disk.
+
+SMART MODE (default):
+    Uses biotop (eBPF) to detect which processes are actively writing
+    to disk in real-time, then targets those. Much more accurate than
+    pattern matching.
 
 RESUMING PAUSED PROCESSES:
-    pkill -CONT -u USERNAME
+    kill -CONT <PID>              # Resume specific process
+    pkill -CONT -u USERNAME       # Resume all for user
 
 EOF
 }
@@ -779,11 +1199,19 @@ EOF
 main() {
     local cmd="run"
 
+    local test_level=""
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             run|stop|status|check|writers|help)
                 cmd="$1"
                 shift
+                ;;
+            test)
+                cmd="test"
+                shift
+                # Optional: test level (notice, warn, harsh, pause, critical, all)
+                [[ $# -gt 0 && "$1" != -* ]] && { test_level="$1"; shift; }
                 ;;
             -c|--config)
                 CONFIG_FILE="$2"
@@ -824,6 +1252,7 @@ main() {
         status)  cmd_status ;;
         check)   cmd_check ;;
         writers) cmd_writers ;;
+        test)    cmd_test "$test_level" ;;
         help)    cmd_help ;;
     esac
 }
