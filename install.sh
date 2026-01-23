@@ -290,12 +290,12 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
         echo -e "  ${DIM}Get alerts via ntfy.sh (free, no account required)${NC}"
         echo -e "  ${DIM}You'll need to install the ntfy app on your phone${NC}"
         echo ""
-        echo -e "    ${CYAN}y${NC})  Yes, set up push notifications"
-        echo -e "    ${CYAN}n${NC})  No, skip this ${DIM}(press Enter to skip)${NC}"
+        echo -e "    ${CYAN}y${NC})  Yes, set up push notifications ${DIM}(press Enter)${NC}"
+        echo -e "    ${CYAN}n${NC})  No, skip this"
         echo ""
-        read -p "  Enable push notifications? [y/N]: " enable_ntfy
+        read -p "  Enable push notifications? [Y/n]: " enable_ntfy
 
-        if [[ "$enable_ntfy" =~ ^[Yy] ]]; then
+        if [[ ! "$enable_ntfy" =~ ^[Nn] ]]; then
             NTFY_TOPIC="disk-watchdog-$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 8)"
             NTFY_URL="https://ntfy.sh/${NTFY_TOPIC}"
 
