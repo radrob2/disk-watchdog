@@ -296,8 +296,8 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
         read -p "  Enable push notifications? [Y/n]: " enable_ntfy
 
         if [[ ! "$enable_ntfy" =~ ^[Nn] ]]; then
-            # Short topic: dw- + 4 lowercase letters (easy to type, no confusing chars)
-            NTFY_TOPIC="dw-$(head /dev/urandom | tr -dc 'a-z' | head -c 4)"
+            # Short topic: 5 lowercase letters (easy to type, no numbers)
+            NTFY_TOPIC="$(head /dev/urandom | tr -dc 'a-z' | head -c 5)"
             NTFY_URL="https://ntfy.sh/${NTFY_TOPIC}"
 
             sed -i "s|^DISK_WATCHDOG_WEBHOOK=.*|DISK_WATCHDOG_WEBHOOK=true|" /etc/disk-watchdog.conf
