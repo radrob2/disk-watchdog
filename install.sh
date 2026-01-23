@@ -82,9 +82,9 @@ fi
 # Banner
 echo ""
 echo -e "${BOLD}┌─────────────────────────────────────────┐${NC}"
-echo -e "${BOLD}│      ${CYAN}disk-watchdog${NC}${BOLD} installer          │${NC}"
+echo -e "${BOLD}│      ${CYAN}disk-watchdog${NC}${BOLD} installer            │${NC}"
 if [[ "$INTERACTIVE" == "yes" ]]; then
-echo -e "${BOLD}│        ${DIM}interactive mode${NC}${BOLD}               │${NC}"
+echo -e "${BOLD}│        ${DIM}interactive mode${NC}${BOLD}                 │${NC}"
 fi
 echo -e "${BOLD}└─────────────────────────────────────────┘${NC}"
 
@@ -102,8 +102,8 @@ if [[ "$INTERACTIVE" == "yes" ]]; then
     echo -e "  ${BOLD}How it responds:${NC}"
     echo ""
     echo -e "  ${DIM}  Disk getting full  →  Warning notifications${NC}"
-    echo -e "  ${DIM}  Disk very low      →  ${NC}${YELLOW}SIGSTOP${NC}${DIM} (pause processes, resumable)${NC}"
-    echo -e "  ${DIM}  Disk critical      →  ${NC}${RED}SIGTERM/SIGKILL${NC}${DIM} (stop processes)${NC}"
+    echo -e "  ${DIM}  Disk very low      →  ${NC}${YELLOW}Pause${NC}${DIM} heavy writers (auto-resumes when space recovers)${NC}"
+    echo -e "  ${DIM}  Disk critical      →  ${NC}${RED}Stop${NC}${DIM} or ${NC}${RED}kill${NC}${DIM} processes to prevent system crash${NC}"
     echo ""
     read -p "  Press Enter to continue with installation... " _
 fi
@@ -404,13 +404,22 @@ if [[ "$INTERACTIVE" == "yes" ]]; then
         PAUSE=$((DISK_SIZE * 2 / 100)); [[ $PAUSE -gt 30 ]] && PAUSE=30
         STOP=$((DISK_SIZE * 1 / 100)); [[ $STOP -gt 15 ]] && STOP=15
         KILL=$((DISK_SIZE * 5 / 1000)); [[ $KILL -gt 5 ]] && KILL=5; [[ $KILL -lt 1 ]] && KILL=1
+        # Resume threshold for auto-resume
+        RESUME=$HARSH; [[ $RESUME -gt 50 ]] && RESUME=50
 
-        echo -e "    ${DIM}< ${NOTICE}GB free${NC}  →  Notice (log only)"
-        echo -e "    ${DIM}< ${WARN}GB free${NC}  →  Warning (desktop notification)"
-        echo -e "    ${DIM}< ${HARSH}GB free${NC}  →  Harsh warning"
-        echo -e "    ${YELLOW}< ${PAUSE}GB free${NC}  →  ${YELLOW}SIGSTOP${NC} (pause processes)"
-        echo -e "    ${RED}< ${STOP}GB free${NC}  →  ${RED}SIGTERM${NC} (stop processes)"
-        echo -e "    ${RED}< ${KILL}GB free${NC}  →  ${RED}SIGKILL${NC} (force kill)"
+        echo -e "    ${DIM}When free space drops below:${NC}"
+        echo ""
+        echo -e "    ${DIM}< ${NOTICE}GB (10%)${NC}  →  Log + check more often"
+        echo -e "    ${DIM}< ${WARN}GB (7%)${NC}   →  Desktop notification"
+        echo -e "    ${DIM}< ${HARSH}GB (4%)${NC}   →  Urgent warning"
+        echo -e "    ${YELLOW}< ${PAUSE}GB (2%)${NC}   →  ${YELLOW}Pause${NC} heavy writers (freezes them)"
+        echo -e "    ${RED}< ${STOP}GB (1%)${NC}   →  ${RED}Stop${NC} processes (graceful shutdown)"
+        echo -e "    ${RED}< ${KILL}GB${NC}        →  ${RED}Force kill${NC} (last resort)"
+        echo ""
+        echo -e "    ${GREEN}> ${RESUME}GB${NC}        →  ${GREEN}Auto-resume${NC} paused processes"
+        echo ""
+        echo -e "  ${DIM}Paused processes resume automatically when disk space recovers.${NC}"
+        echo -e "  ${DIM}If a process is paused 3+ times in an hour, it stays paused.${NC}"
         echo ""
     fi
 

@@ -16,8 +16,8 @@ Adaptive disk space monitor that checks more frequently as your disk fills up, a
 - **Smart writer detection** - finds and stops actual heavy disk writers, not just a predefined list
 - **Auto-calculated thresholds** - sensible defaults based on your disk size
 - **Rate detection** - warns when disk is filling rapidly (e.g., "filling at 2GB/min!")
-- **Graduated response** - warn → pause (SIGSTOP) → stop (SIGTERM) → kill (SIGKILL)
-- **SIGSTOP/SIGCONT support** - pause processes without losing work, resume when space is freed
+- **Graduated response** - warn → pause → stop → force kill (only if needed)
+- **Pause & resume** - freeze processes without losing work, auto-resume when space is freed
 - **Protected processes** - comprehensive list of system-critical processes
 - **Monitors all users** - catches any runaway process, not just one user
 - **Desktop notifications** - via `notify-send`
@@ -62,6 +62,9 @@ disk-watchdog writers
 # Quick check (exits 0 if OK, 1 if warning/critical)
 disk-watchdog check
 
+# Resume all paused processes
+disk-watchdog resume
+
 # Test in dry-run mode (logs but doesn't kill)
 disk-watchdog --dry-run run
 
@@ -70,6 +73,9 @@ disk-watchdog run
 
 # Stop daemon
 disk-watchdog stop
+
+# Uninstall (preserves config/logs)
+sudo disk-watchdog uninstall
 ```
 
 ## Configuration
@@ -146,22 +152,47 @@ Heavy disk writers (radrob):
 
 Critical thresholds are capped at safe maximums regardless of disk size:
 
-| Free Space     | Signal   | Effect |
-|----------------|----------|--------|
-| < 30 GB (max)  | SIGSTOP  | **Pause** - processes freeze, can resume later |
-| < 15 GB (max)  | SIGTERM  | **Stop** - graceful shutdown |
-| < 5 GB (max)   | SIGKILL  | **Kill** - force kill, last resort |
+| Free Space     | Action       | What happens |
+|----------------|--------------|--------------|
+| < 30 GB (2%)   | **Pause**    | Freezes heavy writers - they resume automatically when space recovers |
+| < 15 GB (1%)   | **Stop**     | Graceful shutdown - processes get a chance to clean up |
+| < 5 GB (0.5%)  | **Force kill** | Last resort - immediate termination to prevent system crash |
 
-### Resuming Paused Processes
+### Auto-Resume
 
-When processes are paused with SIGSTOP, they're frozen but not dead. Once you free up space:
+When processes are paused, they're frozen but not dead. disk-watchdog **automatically resumes them** when disk space recovers.
+
+**Anti-thrashing protection:**
+- **Hysteresis**: Only resumes when free space is well above the pause threshold (e.g., pause at 30GB, resume at 68GB)
+- **Cooldown**: Processes must stay paused for 5 minutes minimum before auto-resume
+- **Strike limit**: If a process gets paused 3 times in an hour, it stays paused (needs manual intervention)
 
 ```bash
-# Resume all stopped processes for your user
-pkill -CONT -u $USER
+# Check status of paused processes
+disk-watchdog status
+
+# Manually resume all paused processes
+disk-watchdog resume
 
 # Or resume specific process
 kill -CONT <PID>
+```
+
+**Configuration:**
+```bash
+# In /etc/disk-watchdog.conf
+
+# Disable auto-resume (manual resume only)
+DISK_WATCHDOG_AUTO_RESUME=false
+
+# Resume threshold (default: auto-calculated, ~2x pause threshold)
+DISK_WATCHDOG_RESUME_THRESH=50
+
+# Cooldown in seconds (default: 300 = 5 min)
+DISK_WATCHDOG_RESUME_COOLDOWN=300
+
+# Max pauses per hour before giving up (default: 3)
+DISK_WATCHDOG_RESUME_MAX_STRIKES=3
 ```
 
 ## Push Notifications
@@ -212,6 +243,7 @@ sudo systemctl status disk-watchdog
 | Adaptive intervals | No | No | **Yes** |
 | Real-time I/O (eBPF) | N/A | No | **Yes** |
 | SIGSTOP (pause) | No | No | **Yes** |
+| Auto-resume | No | No | **Yes** |
 | Rate-aware escalation | No | No | **Yes** |
 | Push notifications | No | Email | **Yes** |
 | Auto thresholds | No | No | **Yes** |

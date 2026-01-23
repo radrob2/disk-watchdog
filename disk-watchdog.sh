@@ -99,6 +99,57 @@ DRY_RUN="${DISK_WATCHDOG_DRY_RUN:-false}"
 # Max log file size in bytes (default 10MB)
 MAX_LOG_SIZE="${DISK_WATCHDOG_MAX_LOG:-10485760}"
 
+# Auto-resume settings
+AUTO_RESUME="${DISK_WATCHDOG_AUTO_RESUME:-true}"
+# Resume threshold: hysteresis - only resume when free space is above this
+# Default: 50GB or THRESH_HARSH (whichever is smaller), ensuring we're well above pause threshold
+RESUME_THRESH="${DISK_WATCHDOG_RESUME_THRESH:-auto}"
+# Minimum seconds a process must be paused before auto-resume (prevents rapid cycling)
+RESUME_COOLDOWN="${DISK_WATCHDOG_RESUME_COOLDOWN:-300}"
+# Max pause strikes per hour - if a process gets paused this many times, leave it paused
+RESUME_MAX_STRIKES="${DISK_WATCHDOG_RESUME_MAX_STRIKES:-3}"
+
+# State files for auto-resume
+PAUSED_PIDS_FILE="${STATE_DIR}/paused_pids"
+
+# =============================================================================
+# CONFIG VALIDATION
+# =============================================================================
+
+# Validate a config value is either "auto" or a positive integer
+validate_threshold() {
+    local name="$1"
+    local value="$2"
+    if [[ "$value" != "auto" ]] && ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        die "Invalid config: $name must be 'auto' or a positive integer, got '$value'"
+    fi
+}
+
+# Validate all config values
+validate_config() {
+    validate_threshold "THRESH_NOTICE" "$THRESH_NOTICE"
+    validate_threshold "THRESH_WARN" "$THRESH_WARN"
+    validate_threshold "THRESH_HARSH" "$THRESH_HARSH"
+    validate_threshold "THRESH_PAUSE" "$THRESH_PAUSE"
+    validate_threshold "THRESH_STOP" "$THRESH_STOP"
+    validate_threshold "THRESH_KILL" "$THRESH_KILL"
+    validate_threshold "RESUME_THRESH" "$RESUME_THRESH"
+
+    # Validate other numeric configs
+    if ! [[ "$RATE_WARN_GB_PER_MIN" =~ ^[0-9]+$ ]]; then
+        die "Invalid config: RATE_WARN must be a positive integer, got '$RATE_WARN_GB_PER_MIN'"
+    fi
+    if ! [[ "$NOTIFY_COOLDOWN" =~ ^[0-9]+$ ]]; then
+        die "Invalid config: NOTIFY_COOLDOWN must be a positive integer, got '$NOTIFY_COOLDOWN'"
+    fi
+    if ! [[ "$RESUME_COOLDOWN" =~ ^[0-9]+$ ]]; then
+        die "Invalid config: RESUME_COOLDOWN must be a positive integer, got '$RESUME_COOLDOWN'"
+    fi
+    if ! [[ "$RESUME_MAX_STRIKES" =~ ^[0-9]+$ ]]; then
+        die "Invalid config: RESUME_MAX_STRIKES must be a positive integer, got '$RESUME_MAX_STRIKES'"
+    fi
+}
+
 # =============================================================================
 # THRESHOLD CALCULATION
 # =============================================================================
@@ -157,10 +208,20 @@ calculate_thresholds() {
         (( THRESH_KILL > MAX_THRESH_KILL )) && THRESH_KILL=$MAX_THRESH_KILL
         (( THRESH_KILL < 1 )) && THRESH_KILL=1  # minimum 1GB
     fi
+
+    # Resume threshold: must be well above pause threshold to prevent cycling
+    # Default: THRESH_HARSH (4%) or 50GB, whichever is smaller
+    if [[ "$RESUME_THRESH" == "auto" ]]; then
+        RESUME_THRESH=$THRESH_HARSH
+        (( RESUME_THRESH > 50 )) && RESUME_THRESH=50
+        # Ensure it's at least 2x the pause threshold
+        (( RESUME_THRESH < THRESH_PAUSE * 2 )) && RESUME_THRESH=$(( THRESH_PAUSE * 2 ))
+    fi
 }
 
 # Initialize thresholds (call this before using threshold values)
 init_thresholds() {
+    validate_config
     calculate_thresholds
 }
 
@@ -198,21 +259,49 @@ notify_desktop() {
     local title="$2"
     local msg="$3"
 
+    # Sanitize inputs to prevent command injection (remove quotes and special chars)
+    title="${title//\'/}"
+    title="${title//\"/}"
+    title="${title//\`/}"
+    title="${title//\$/}"
+    msg="${msg//\'/}"
+    msg="${msg//\"/}"
+    msg="${msg//\`/}"
+    msg="${msg//\$/}"
+
     # Determine which user to notify
     local notify_user="$TARGET_USER"
     if [[ -z "$notify_user" ]]; then
-        # Find logged-in GUI user (first user with a display)
+        # Find logged-in GUI user (first user with a display or Wayland session)
         notify_user=$(who | awk '/:/ {print $1; exit}')
+        # Fallback: check for any logged-in user with a session
+        if [[ -z "$notify_user" ]]; then
+            notify_user=$(loginctl list-users --no-legend 2>/dev/null | awk 'NR==1 {print $2}')
+        fi
     fi
 
-    if [[ -n "$notify_user" ]]; then
-        # Try multiple display methods
-        for display in :0 :1; do
-            su - "$notify_user" -c "DISPLAY=$display notify-send -u '$urgency' '$title' '$msg'" 2>/dev/null && return 0
-        done
-        # Try without DISPLAY (wayland)
-        su - "$notify_user" -c "notify-send -u '$urgency' '$title' '$msg'" 2>/dev/null || true
+    [[ -z "$notify_user" ]] && return 0
+
+    # Get user's runtime dir for Wayland
+    local user_uid
+    user_uid=$(id -u "$notify_user" 2>/dev/null) || return 0
+    local runtime_dir="/run/user/$user_uid"
+
+    # Try Wayland first (modern systems), then X11
+    # Use 'su' without '-' to avoid slow login shell
+    if [[ -d "$runtime_dir" ]]; then
+        # Wayland
+        su "$notify_user" -s /bin/sh -c \
+            "XDG_RUNTIME_DIR='$runtime_dir' notify-send -u '$urgency' '$title' '$msg'" 2>/dev/null && return 0
     fi
+
+    # X11 fallback
+    for display in :0 :1; do
+        su "$notify_user" -s /bin/sh -c \
+            "DISPLAY=$display notify-send -u '$urgency' '$title' '$msg'" 2>/dev/null && return 0
+    done
+
+    return 1
 }
 
 notify_wall() {
@@ -260,19 +349,34 @@ notify_webhook() {
     local hostname
     hostname=$(hostname)
 
+    # Escape special characters for JSON (prevent injection)
+    json_escape() {
+        local str="$1"
+        str="${str//\\/\\\\}"  # backslash first
+        str="${str//\"/\\\"}"  # double quotes
+        str="${str//$'\n'/\\n}" # newlines
+        str="${str//$'\r'/\\r}" # carriage returns
+        str="${str//$'\t'/\\t}" # tabs
+        echo "$str"
+    }
+
+    title=$(json_escape "$title")
+    msg=$(json_escape "$msg")
+    hostname=$(json_escape "$hostname")
+
     # Detect webhook type from URL and format accordingly
     if [[ "$WEBHOOK_URL" == *"hooks.slack.com"* ]]; then
         # Slack format
         curl -s -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"*${title}* (${hostname})\n${msg}\"}" \
+            --data "{\"text\":\"*${title}* (${hostname})\\n${msg}\"}" \
             "$WEBHOOK_URL" &>/dev/null || true
     elif [[ "$WEBHOOK_URL" == *"discord.com/api/webhooks"* ]]; then
         # Discord format
         curl -s -X POST -H 'Content-type: application/json' \
-            --data "{\"content\":\"**${title}** (${hostname})\n${msg}\"}" \
+            --data "{\"content\":\"**${title}** (${hostname})\\n${msg}\"}" \
             "$WEBHOOK_URL" &>/dev/null || true
     elif [[ "$WEBHOOK_URL" == *"ntfy"* ]]; then
-        # ntfy.sh format
+        # ntfy.sh format (not JSON, but sanitize anyway)
         curl -s -X POST \
             -H "Title: ${title}" \
             -H "Priority: high" \
@@ -395,6 +499,7 @@ write_state() {
 # =============================================================================
 
 # Add a process to known heavy writers list
+# Uses TAB delimiter to handle process names with colons
 track_writer() {
     local pid="$1"
     local comm="$2"
@@ -402,13 +507,13 @@ track_writer() {
     local timestamp
     timestamp=$(date +%s)
 
-    # Format: pid:comm:bytes:first_seen:last_seen
+    # Format: pid<TAB>comm<TAB>bytes<TAB>first_seen<TAB>last_seen
     # Update if exists, add if new
-    if [[ -f "$WRITERS_FILE" ]] && grep -q "^${pid}:" "$WRITERS_FILE" 2>/dev/null; then
-        # Update existing entry (update bytes and last_seen)
-        sed -i "s/^${pid}:.*/${pid}:${comm}:${bytes}:.*:${timestamp}/" "$WRITERS_FILE" 2>/dev/null || true
+    if [[ -f "$WRITERS_FILE" ]] && grep -q "^${pid}	" "$WRITERS_FILE" 2>/dev/null; then
+        # Update existing entry (preserve first_seen, update bytes and last_seen)
+        sed -i "s/^${pid}	[^	]*	[^	]*	\([^	]*\)	.*/${pid}	${comm}	${bytes}	\1	${timestamp}/" "$WRITERS_FILE" 2>/dev/null || true
     else
-        echo "${pid}:${comm}:${bytes}:${timestamp}:${timestamp}" >> "$WRITERS_FILE" 2>/dev/null || true
+        printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$comm" "$bytes" "$timestamp" "$timestamp" >> "$WRITERS_FILE" 2>/dev/null || true
     fi
 }
 
@@ -416,7 +521,8 @@ track_writer() {
 get_tracked_writers() {
     [[ ! -f "$WRITERS_FILE" ]] && return
 
-    while IFS=: read -r pid comm bytes first_seen last_seen; do
+    while IFS=$'\t' read -r pid comm bytes first_seen last_seen; do
+        [[ -z "$pid" ]] && continue
         # Check if process still exists
         if [[ -d "/proc/$pid" ]]; then
             # Check if it's the same process (comm matches)
@@ -436,17 +542,174 @@ cleanup_tracked_writers() {
     local temp_file="${WRITERS_FILE}.tmp"
     > "$temp_file"
 
-    while IFS=: read -r pid comm bytes first_seen last_seen; do
+    while IFS=$'\t' read -r pid comm bytes first_seen last_seen; do
+        [[ -z "$pid" ]] && continue
         if [[ -d "/proc/$pid" ]]; then
             local current_comm
             current_comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
             if [[ "$current_comm" == "$comm" ]]; then
-                echo "${pid}:${comm}:${bytes}:${first_seen}:${last_seen}" >> "$temp_file"
+                printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$comm" "$bytes" "$first_seen" "$last_seen" >> "$temp_file"
             fi
         fi
     done < "$WRITERS_FILE" 2>/dev/null
 
     mv "$temp_file" "$WRITERS_FILE" 2>/dev/null || true
+}
+
+# =============================================================================
+# AUTO-RESUME PAUSED PROCESSES
+# =============================================================================
+
+# Record a paused process for auto-resume tracking
+# Format: pid:comm:pause_time:strikes
+record_paused_pid() {
+    local pid="$1"
+    local comm="$2"
+    local now
+    now=$(date +%s)
+
+    [[ "$AUTO_RESUME" != "true" ]] && return
+
+    # Check if this process was recently paused (within the hour) - increment strikes
+    local strikes=1
+    if [[ -f "$PAUSED_PIDS_FILE" ]]; then
+        local old_entry
+        old_entry=$(grep "^${pid}:${comm}:" "$PAUSED_PIDS_FILE" 2>/dev/null | tail -1)
+        if [[ -n "$old_entry" ]]; then
+            local old_time old_strikes
+            old_time=$(echo "$old_entry" | cut -d: -f3)
+            old_strikes=$(echo "$old_entry" | cut -d: -f4)
+            # If paused within last hour, increment strikes
+            if (( now - old_time < 3600 )); then
+                strikes=$(( old_strikes + 1 ))
+            fi
+            # Remove old entry
+            sed -i "/^${pid}:${comm}:/d" "$PAUSED_PIDS_FILE" 2>/dev/null || true
+        fi
+    fi
+
+    echo "${pid}:${comm}:${now}:${strikes}" >> "$PAUSED_PIDS_FILE" 2>/dev/null || true
+
+    if (( strikes >= RESUME_MAX_STRIKES )); then
+        log_msg "WARN" "Process $comm (PID $pid) paused $strikes times in an hour - will NOT auto-resume"
+    fi
+}
+
+# Check if a process is stopped (state T)
+is_process_stopped() {
+    local pid="$1"
+    local state
+    state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)
+    [[ "$state" == "T" ]]
+}
+
+# Check if we should resume processes and do it
+check_auto_resume() {
+    [[ "$AUTO_RESUME" != "true" ]] && return
+    [[ ! -f "$PAUSED_PIDS_FILE" ]] && return
+
+    local free="$1"
+    local now
+    now=$(date +%s)
+
+    # Only resume if we're well above the pause threshold (hysteresis)
+    (( free < RESUME_THRESH )) && return
+
+    local temp_file="${PAUSED_PIDS_FILE}.tmp"
+    local resumed_names=()
+    > "$temp_file"
+
+    while IFS=: read -r pid comm pause_time strikes; do
+        [[ -z "$pid" ]] && continue
+
+        # Check if process still exists
+        if [[ ! -d "/proc/$pid" ]]; then
+            log_msg "DEBUG" "Paused process $comm (PID $pid) no longer exists, removing from list"
+            continue
+        fi
+
+        # Verify it's still the same process
+        local current_comm
+        current_comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+        if [[ "$current_comm" != "$comm" ]]; then
+            log_msg "DEBUG" "PID $pid is now $current_comm (was $comm), removing from list"
+            continue
+        fi
+
+        # Check if process is actually stopped
+        if ! is_process_stopped "$pid"; then
+            log_msg "DEBUG" "Process $comm (PID $pid) is not stopped, removing from list"
+            continue
+        fi
+
+        # Check strike limit
+        if (( strikes >= RESUME_MAX_STRIKES )); then
+            log_msg "DEBUG" "Process $comm (PID $pid) has $strikes strikes, keeping paused"
+            echo "${pid}:${comm}:${pause_time}:${strikes}" >> "$temp_file"
+            continue
+        fi
+
+        # Check cooldown
+        local paused_seconds=$(( now - pause_time ))
+        if (( paused_seconds < RESUME_COOLDOWN )); then
+            local remaining=$(( RESUME_COOLDOWN - paused_seconds ))
+            log_msg "DEBUG" "Process $comm (PID $pid) in cooldown, ${remaining}s remaining"
+            echo "${pid}:${comm}:${pause_time}:${strikes}" >> "$temp_file"
+            continue
+        fi
+
+        # All checks passed - resume the process
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_msg "DRY-RUN" "Would resume $comm (PID $pid) - disk space recovered to ${free}GB"
+            resumed_names+=("$comm")
+        else
+            if kill -CONT "$pid" 2>/dev/null; then
+                log_msg "RESUME" "Auto-resumed $comm (PID $pid) - disk space recovered to ${free}GB"
+                resumed_names+=("$comm")
+            else
+                log_msg "WARN" "Failed to resume $comm (PID $pid)"
+            fi
+        fi
+        # Don't keep in list after resume (if it fills disk again, it'll be re-paused and re-tracked)
+    done < "$PAUSED_PIDS_FILE" 2>/dev/null
+
+    mv "$temp_file" "$PAUSED_PIDS_FILE" 2>/dev/null || true
+
+    # Notify if we resumed anything
+    if (( ${#resumed_names[@]} > 0 )); then
+        local msg="Disk recovered to ${free}GB. Resumed: ${resumed_names[*]}"
+        notify_desktop "normal" "Processes Resumed" "$msg"
+        notify_webhook "Processes Resumed" "$msg"
+    fi
+}
+
+# Clean up stale entries from paused pids file
+cleanup_paused_pids() {
+    [[ ! -f "$PAUSED_PIDS_FILE" ]] && return
+
+    local temp_file="${PAUSED_PIDS_FILE}.tmp"
+    local now
+    now=$(date +%s)
+    > "$temp_file"
+
+    while IFS=: read -r pid comm pause_time strikes; do
+        [[ -z "$pid" ]] && continue
+
+        # Remove entries for dead processes
+        [[ ! -d "/proc/$pid" ]] && continue
+
+        # Remove entries older than 2 hours (stale)
+        (( now - pause_time > 7200 )) && continue
+
+        # Verify same process
+        local current_comm
+        current_comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+        [[ "$current_comm" != "$comm" ]] && continue
+
+        echo "${pid}:${comm}:${pause_time}:${strikes}" >> "$temp_file"
+    done < "$PAUSED_PIDS_FILE" 2>/dev/null
+
+    mv "$temp_file" "$PAUSED_PIDS_FILE" 2>/dev/null || true
 }
 
 # =============================================================================
@@ -469,8 +732,9 @@ calculate_rate() {
 
             if (( time_diff > 0 && bytes_diff < 0 )); then
                 # Disk is filling (free space decreased)
-                local bytes_per_sec=$(( -bytes_diff / time_diff ))
-                gb_per_min=$(( bytes_per_sec * 60 / 1024 / 1024 / 1024 ))
+                # Use awk for floating point to avoid losing rates < 1GB/min
+                gb_per_min=$(awk -v diff="$bytes_diff" -v tdiff="$time_diff" \
+                    'BEGIN { printf "%d", (-diff / tdiff * 60) / (1024*1024*1024) }')
             fi
         fi
     fi
@@ -631,6 +895,7 @@ format_bytes() {
 kill_heavy_writers() {
     local signal="$1"
     local max_count="${2:-5}"
+    local track_for_resume="${3:-false}"  # If true, record PIDs for auto-resume
     local killed=0
     local killed_names=()
 
@@ -645,10 +910,12 @@ kill_heavy_writers() {
             if [[ "$DRY_RUN" == "true" ]]; then
                 log_msg "DRY-RUN" "Would send $signal to $comm (PID $pid, wrote $bytes_fmt)"
                 killed_names+=("$comm($bytes_fmt)")
+                [[ "$track_for_resume" == "true" ]] && record_paused_pid "$pid" "$comm"
             else
                 if kill "$signal" "$pid" 2>/dev/null; then
                     log_msg "ACTION" "Sent $signal to $comm (PID $pid, wrote $bytes_fmt)"
                     killed_names+=("$comm($bytes_fmt)")
+                    [[ "$track_for_resume" == "true" ]] && record_paused_pid "$pid" "$comm"
                     (( killed++ ))
                 fi
             fi
@@ -674,10 +941,12 @@ kill_heavy_writers() {
             if [[ "$DRY_RUN" == "true" ]]; then
                 log_msg "DRY-RUN" "Would send $signal to $comm (PID $pid)"
                 killed_names+=("$comm")
+                [[ "$track_for_resume" == "true" ]] && record_paused_pid "$pid" "$comm"
             else
                 if kill "$signal" "$pid" 2>/dev/null; then
                     log_msg "ACTION" "Sent $signal to $comm (PID $pid)"
                     killed_names+=("$comm")
+                    [[ "$track_for_resume" == "true" ]] && record_paused_pid "$pid" "$comm"
                     (( killed++ ))
                 fi
             fi
@@ -736,11 +1005,17 @@ action_pause() {
     log_msg "WARNING" "${free}GB free - sending SIGSTOP (pause)"
 
     local paused
-    paused=$(kill_heavy_writers "-STOP" 5)
+    # Pass true to track_for_resume so we can auto-resume these later
+    paused=$(kill_heavy_writers "-STOP" 5 true)
 
     if [[ -n "$paused" ]]; then
-        local resume_hint="Resume with: kill -CONT <PID>"
-        [[ -n "$TARGET_USER" ]] && resume_hint="Resume with: pkill -CONT -u $TARGET_USER"
+        local resume_hint
+        if [[ "$AUTO_RESUME" == "true" ]]; then
+            resume_hint="Will auto-resume when disk recovers to ${RESUME_THRESH}GB+"
+        else
+            resume_hint="Resume with: kill -CONT <PID>"
+            [[ -n "$TARGET_USER" ]] && resume_hint="Resume with: pkill -CONT -u $TARGET_USER"
+        fi
         local msg="${free}GB free! PAUSED: $paused"
         notify_desktop "critical" "DISK LOW" "$msg - $resume_hint"
         notify_wall "DISK LOW: $msg - $resume_hint"
@@ -837,9 +1112,28 @@ cmd_status() {
     echo "  Notice: <${THRESH_NOTICE}GB (10%)"
     echo "  Warn:   <${THRESH_WARN}GB (7%)"
     echo "  Harsh:  <${THRESH_HARSH}GB (4%)"
-    echo "  Pause:  <${THRESH_PAUSE}GB (2%, max ${MAX_THRESH_PAUSE}GB) - SIGSTOP"
-    echo "  Stop:   <${THRESH_STOP}GB (1%, max ${MAX_THRESH_STOP}GB) - SIGTERM"
-    echo "  Kill:   <${THRESH_KILL}GB (0.5%, max ${MAX_THRESH_KILL}GB) - SIGKILL"
+    echo "  Pause:  <${THRESH_PAUSE}GB (2%, max ${MAX_THRESH_PAUSE}GB) - freeze processes"
+    echo "  Stop:   <${THRESH_STOP}GB (1%, max ${MAX_THRESH_STOP}GB) - graceful stop"
+    echo "  Kill:   <${THRESH_KILL}GB (0.5%, max ${MAX_THRESH_KILL}GB) - force kill"
+    echo ""
+    echo "Auto-resume: $AUTO_RESUME"
+    if [[ "$AUTO_RESUME" == "true" ]]; then
+        echo "  Resume when:  >${RESUME_THRESH}GB free (hysteresis)"
+        echo "  Cooldown:     ${RESUME_COOLDOWN}s minimum paused"
+        echo "  Max strikes:  ${RESUME_MAX_STRIKES} pauses/hour before giving up"
+        if [[ -f "$PAUSED_PIDS_FILE" ]] && [[ -s "$PAUSED_PIDS_FILE" ]]; then
+            echo ""
+            echo "Currently paused processes:"
+            while IFS=: read -r pid comm pause_time strikes; do
+                [[ -z "$pid" ]] && continue
+                [[ ! -d "/proc/$pid" ]] && continue
+                local paused_ago=$(( $(date +%s) - pause_time ))
+                local mins=$(( paused_ago / 60 ))
+                local secs=$(( paused_ago % 60 ))
+                printf "  PID %s (%s) - paused %dm%ds ago, %d strike(s)\n" "$pid" "$comm" "$mins" "$secs" "$strikes"
+            done < "$PAUSED_PIDS_FILE"
+        fi
+    fi
     echo ""
     echo "Currently writing to $device (real-time via eBPF):"
 
@@ -986,25 +1280,29 @@ cmd_test() {
 }
 
 cmd_run() {
+    # Validate mount point exists and is accessible
+    if ! df "$MOUNT_POINT" &>/dev/null; then
+        die "Mount point '$MOUNT_POINT' is not accessible or doesn't exist"
+    fi
+
     # Initialize thresholds based on disk size
     init_thresholds
 
     # Require biotop
     require_biotop
 
-    # Check for existing instance
-    if [[ -f "$PID_FILE" ]]; then
-        local old_pid
-        old_pid=$(cat "$PID_FILE" 2>/dev/null)
-        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-            die "Already running (PID $old_pid). Use 'disk-watchdog stop' first."
-        fi
-    fi
-
-    # Setup
+    # Setup directories first
     mkdir -p "$STATE_DIR" 2>/dev/null || die "Cannot create state directory: $STATE_DIR"
     touch "$LOG_FILE" 2>/dev/null || die "Cannot write to log file: $LOG_FILE"
-    echo $$ > "$PID_FILE" 2>/dev/null || die "Cannot write PID file: $PID_FILE"
+
+    # Acquire exclusive lock (prevents race condition)
+    exec 200>"$PID_FILE"
+    if ! flock -n 200; then
+        local old_pid
+        old_pid=$(cat "$PID_FILE" 2>/dev/null)
+        die "Already running (PID ${old_pid:-unknown}). Use 'disk-watchdog stop' first."
+    fi
+    echo $$ > "$PID_FILE"
 
     # Signal handlers
     trap 'log_msg "INFO" "Received SIGTERM, shutting down"; rm -f "$PID_FILE"; exit 0' SIGTERM
@@ -1017,6 +1315,8 @@ cmd_run() {
 
     local last_level
     last_level=$(read_state)
+
+    local last_cleanup=0
 
     # Main loop
     while true; do
@@ -1040,8 +1340,17 @@ cmd_run() {
         level=$(get_level "$free" "$rate")  # Pass rate for rate-aware escalation
         interval=$(get_check_interval "$free")
 
-        # Periodically clean up tracked writers (every ~5 minutes at normal interval)
-        cleanup_tracked_writers
+        # Periodically clean up tracked writers and paused pids (every 60s, not every loop)
+        local now
+        now=$(date +%s)
+        if (( now - last_cleanup >= 60 )); then
+            cleanup_tracked_writers
+            cleanup_paused_pids
+            last_cleanup=$now
+        fi
+
+        # Check if we should auto-resume paused processes
+        check_auto_resume "$free"
 
         # Log rate warnings
         if (( rate > 0 )); then
@@ -1136,6 +1445,75 @@ cmd_stop() {
     fi
 }
 
+cmd_resume() {
+    init_thresholds
+
+    if [[ ! -f "$PAUSED_PIDS_FILE" ]] || [[ ! -s "$PAUSED_PIDS_FILE" ]]; then
+        echo "No paused processes tracked."
+        return 0
+    fi
+
+    echo "Resuming all paused processes..."
+    local resumed=0
+
+    while IFS=: read -r pid comm pause_time strikes; do
+        [[ -z "$pid" ]] && continue
+        [[ ! -d "/proc/$pid" ]] && continue
+
+        if is_process_stopped "$pid"; then
+            if kill -CONT "$pid" 2>/dev/null; then
+                echo "  Resumed $comm (PID $pid)"
+                log_msg "RESUME" "Manually resumed $comm (PID $pid)"
+                (( resumed++ ))
+            else
+                echo "  Failed to resume $comm (PID $pid)"
+            fi
+        fi
+    done < "$PAUSED_PIDS_FILE"
+
+    # Clear the paused pids file
+    > "$PAUSED_PIDS_FILE"
+
+    if (( resumed > 0 )); then
+        echo "Resumed $resumed process(es)."
+    else
+        echo "No stopped processes found to resume."
+    fi
+}
+
+cmd_uninstall() {
+    echo "Uninstalling disk-watchdog..."
+
+    # Stop service if running
+    if systemctl is-active disk-watchdog &>/dev/null; then
+        echo "  Stopping service..."
+        systemctl stop disk-watchdog
+    fi
+
+    # Disable service
+    if systemctl is-enabled disk-watchdog &>/dev/null; then
+        echo "  Disabling service..."
+        systemctl disable disk-watchdog
+    fi
+
+    # Remove files
+    echo "  Removing files..."
+    rm -f /usr/local/bin/disk-watchdog
+    rm -f /etc/systemd/system/disk-watchdog.service
+    rm -f /run/disk-watchdog.pid
+
+    # Reload systemd
+    systemctl daemon-reload 2>/dev/null || true
+
+    echo ""
+    echo "Uninstalled. Config and logs preserved:"
+    echo "  /etc/disk-watchdog.conf"
+    echo "  /var/log/disk-watchdog.log"
+    echo "  /var/lib/disk-watchdog/"
+    echo ""
+    echo "To fully remove: rm -rf /etc/disk-watchdog.conf /var/log/disk-watchdog.log /var/lib/disk-watchdog"
+}
+
 cmd_help() {
     cat << 'EOF'
 disk-watchdog - Adaptive disk space monitor with eBPF-based I/O detection
@@ -1149,7 +1527,9 @@ COMMANDS:
     status      Show current disk status, thresholds, and top writers
     check       Quick check - exits 0 if OK, 1 if warning/critical
     writers     Show top disk writers (real-time via eBPF)
+    resume      Manually resume all paused processes
     test        Test notifications without taking action
+    uninstall   Remove disk-watchdog (preserves config/logs)
     help        Show this help
 
 OPTIONS:
@@ -1174,20 +1554,25 @@ QUICK START:
 
 THRESHOLDS:
     Auto-calculated based on disk size. Critical thresholds capped:
-      Pause: 2% of disk (max 30GB) - SIGSTOP, resumable
-      Stop:  1% of disk (max 15GB) - SIGTERM
-      Kill:  0.5% of disk (max 5GB) - SIGKILL
+      Pause: 2% of disk (max 30GB) - freezes processes, auto-resumes
+      Stop:  1% of disk (max 15GB) - graceful shutdown
+      Kill:  0.5% of disk (max 5GB) - force kill, last resort
 
     Run 'disk-watchdog status' to see calculated values for your disk.
+
+AUTO-RESUME:
+    Paused processes are automatically resumed when disk space recovers.
+    Anti-thrashing protection:
+      - Hysteresis: only resume when well above pause threshold
+      - Cooldown: processes must stay paused for 5 minutes minimum
+      - Strike limit: if paused 3x in an hour, stays paused (manual resume needed)
+
+    Manual resume: disk-watchdog resume
 
 SMART MODE (default):
     Uses biotop (eBPF) to detect which processes are actively writing
     to disk in real-time, then targets those. Much more accurate than
     pattern matching.
-
-RESUMING PAUSED PROCESSES:
-    kill -CONT <PID>              # Resume specific process
-    pkill -CONT -u USERNAME       # Resume all for user
 
 EOF
 }
@@ -1203,7 +1588,7 @@ main() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            run|stop|status|check|writers|help)
+            run|stop|status|check|writers|resume|uninstall|help)
                 cmd="$1"
                 shift
                 ;;
@@ -1247,13 +1632,15 @@ main() {
     done
 
     case "$cmd" in
-        run)     cmd_run ;;
-        stop)    cmd_stop ;;
-        status)  cmd_status ;;
-        check)   cmd_check ;;
-        writers) cmd_writers ;;
-        test)    cmd_test "$test_level" ;;
-        help)    cmd_help ;;
+        run)       cmd_run ;;
+        stop)      cmd_stop ;;
+        status)    cmd_status ;;
+        check)     cmd_check ;;
+        writers)   cmd_writers ;;
+        resume)    cmd_resume ;;
+        uninstall) cmd_uninstall ;;
+        test)      cmd_test "$test_level" ;;
+        help)      cmd_help ;;
     esac
 }
 
