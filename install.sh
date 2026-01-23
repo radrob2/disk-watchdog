@@ -20,7 +20,12 @@ NC='\033[0m' # No Color
 header() {
     echo ""
     echo -e "${BOLD}${BLUE}$1${NC}"
-    echo -e "${DIM}$(printf '%.0s─' {1..50})${NC}"
+    echo -e "${DIM}$(printf '%.0s─' {1..55})${NC}"
+}
+
+subheader() {
+    echo ""
+    echo -e "  ${BOLD}$1${NC}"
 }
 
 step() {
@@ -76,12 +81,32 @@ fi
 
 # Banner
 echo ""
-echo -e "${BOLD}┌────────────────────────────────────────┐${NC}"
-echo -e "${BOLD}│         ${CYAN}disk-watchdog${NC} ${BOLD}installer        │${NC}"
+echo -e "${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
+echo -e "${BOLD}│              ${CYAN}disk-watchdog${NC} ${BOLD}installer                    │${NC}"
 if [[ "$INTERACTIVE" == "yes" ]]; then
-echo -e "${BOLD}│            ${DIM}interactive mode${NC}${BOLD}            │${NC}"
+echo -e "${BOLD}│                ${DIM}interactive mode${NC}${BOLD}                        │${NC}"
 fi
-echo -e "${BOLD}└────────────────────────────────────────┘${NC}"
+echo -e "${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
+
+# Show what disk-watchdog does in interactive mode
+if [[ "$INTERACTIVE" == "yes" ]]; then
+    echo ""
+    echo -e "  ${BOLD}What is disk-watchdog?${NC}"
+    echo ""
+    echo -e "  ${DIM}An adaptive disk space monitor that:${NC}"
+    echo -e "  ${DIM}• Checks more frequently as disk fills up${NC}"
+    echo -e "  ${DIM}• Detects which processes are writing heavily (via eBPF)${NC}"
+    echo -e "  ${DIM}• Pauses or stops runaway processes before disk is full${NC}"
+    echo -e "  ${DIM}• Sends notifications so you know what's happening${NC}"
+    echo ""
+    echo -e "  ${BOLD}How it responds:${NC}"
+    echo ""
+    echo -e "  ${DIM}  Disk getting full  →  Warning notifications${NC}"
+    echo -e "  ${DIM}  Disk very low      →  ${NC}${YELLOW}SIGSTOP${NC}${DIM} (pause processes, resumable)${NC}"
+    echo -e "  ${DIM}  Disk critical      →  ${NC}${RED}SIGTERM/SIGKILL${NC}${DIM} (stop processes)${NC}"
+    echo ""
+    read -p "  Press Enter to continue with installation... " _
+fi
 
 # Check for root
 if [[ $EUID -ne 0 ]]; then
@@ -141,7 +166,7 @@ fi
 # ============================================================
 # STEP 1: Dependencies
 # ============================================================
-header "1/4  Dependencies"
+header "1/4  Installing dependencies"
 
 if ! command -v biotop-bpfcc &>/dev/null && ! command -v biotop &>/dev/null; then
     step "Installing eBPF tools ($BIOTOP_PKG)..."
@@ -172,20 +197,25 @@ info "Using: $BIOTOP_CMD"
 # ============================================================
 # STEP 2: Download
 # ============================================================
-header "2/4  Download"
+header "2/4  Downloading files"
 
 step "Downloading disk-watchdog..."
 download "$REPO_URL/disk-watchdog.sh" /usr/local/bin/disk-watchdog
 chmod +x /usr/local/bin/disk-watchdog
-success "Installed /usr/local/bin/disk-watchdog"
+success "/usr/local/bin/disk-watchdog"
 
 download "$REPO_URL/disk-watchdog.service" /etc/systemd/system/disk-watchdog.service
-success "Installed systemd service"
+success "/etc/systemd/system/disk-watchdog.service"
 
 # ============================================================
 # STEP 3: Configure
 # ============================================================
-header "3/4  Configure"
+header "3/4  Configuration"
+
+# Track configuration choices for summary
+CONFIG_MOUNT="/"
+CONFIG_USER="all users"
+CONFIG_NOTIFY="none"
 
 if [[ ! -f /etc/disk-watchdog.conf ]]; then
     download "$REPO_URL/disk-watchdog.conf" /etc/disk-watchdog.conf
@@ -193,9 +223,27 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
     success "Created /etc/disk-watchdog.conf"
 
     if [[ "$INTERACTIVE" == "yes" ]]; then
-        # --- Process Monitoring ---
+
+        # --- Mount Point ---
+        subheader "Which disk to monitor?"
         echo ""
-        echo -e "  ${BOLD}Which processes should disk-watchdog monitor?${NC}"
+        echo -e "  ${DIM}Current mount points:${NC}"
+        df -h --output=target,size,avail,pcent -x tmpfs -x devtmpfs 2>/dev/null | head -6 | tail -5 | while read line; do
+            echo -e "    ${DIM}$line${NC}"
+        done
+        echo ""
+        read -p "  Mount point to monitor (default: /): " mount_choice
+
+        if [[ -n "$mount_choice" ]] && [[ -d "$mount_choice" ]]; then
+            sed -i "s|^DISK_WATCHDOG_MOUNT=.*|DISK_WATCHDOG_MOUNT=$mount_choice|" /etc/disk-watchdog.conf
+            CONFIG_MOUNT="$mount_choice"
+            success "Monitoring: $mount_choice"
+        else
+            success "Monitoring: / (default)"
+        fi
+
+        # --- Process Monitoring Scope ---
+        subheader "Which processes to manage?"
         echo ""
         echo -e "    ${CYAN}1${NC})  All users ${DIM}(recommended)${NC}"
         echo -e "        ${DIM}Catches any runaway process on the system${NC}"
@@ -208,23 +256,28 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
         if [[ "$monitor_choice" == "2" ]]; then
             REAL_USER="${SUDO_USER:-}"
             if [[ -z "$REAL_USER" ]]; then
-                read -p "  Enter username to monitor: " REAL_USER
+                read -p "  Enter username: " REAL_USER
             else
-                read -p "  Enter username (default: $REAL_USER): " input_user
+                read -p "  Username (default: $REAL_USER): " input_user
                 [[ -n "$input_user" ]] && REAL_USER="$input_user"
             fi
             if [[ -n "$REAL_USER" ]]; then
                 sed -i "s|^DISK_WATCHDOG_USER=.*|DISK_WATCHDOG_USER=$REAL_USER|" /etc/disk-watchdog.conf
-                success "Monitoring user: $REAL_USER"
+                CONFIG_USER="$REAL_USER"
+                success "Managing processes for: $REAL_USER"
             fi
         else
-            success "Monitoring all users"
+            success "Managing processes for: all users"
         fi
 
         # --- Push Notifications ---
+        subheader "Push notifications to your phone?"
         echo ""
-        echo -e "  ${BOLD}Push notifications to your phone?${NC}"
-        echo -e "  ${DIM}Uses ntfy.sh - free, no account required${NC}"
+        echo -e "  ${DIM}Get alerts via ntfy.sh (free, no account required)${NC}"
+        echo -e "  ${DIM}You'll need to install the ntfy app on your phone${NC}"
+        echo ""
+        echo -e "    ${CYAN}y${NC})  Yes, set up push notifications"
+        echo -e "    ${CYAN}n${NC})  No, skip this ${DIM}(press Enter to skip)${NC}"
         echo ""
         read -p "  Enable push notifications? [y/N]: " enable_ntfy
 
@@ -234,9 +287,9 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
 
             sed -i "s|^DISK_WATCHDOG_WEBHOOK=.*|DISK_WATCHDOG_WEBHOOK=true|" /etc/disk-watchdog.conf
             sed -i "s|^# DISK_WATCHDOG_WEBHOOK_URL=https://ntfy.sh/.*|DISK_WATCHDOG_WEBHOOK_URL=${NTFY_URL}|" /etc/disk-watchdog.conf
+            CONFIG_NOTIFY="ntfy.sh"
 
             success "Push notifications enabled"
-            echo ""
 
             # Install qrencode if needed
             if ! command -v qrencode &>/dev/null; then
@@ -250,46 +303,48 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
             fi
 
             if command -v qrencode &>/dev/null; then
-                # ntfy app install
-                echo -e "  ${BOLD}Step 1: Install the ntfy app${NC}"
+                echo ""
+                echo -e "  ${BOLD}${CYAN}Step 1:${NC} ${BOLD}Install the ntfy app${NC}"
                 echo -e "  ${DIM}Scan this QR code or visit: https://ntfy.sh${NC}"
                 echo ""
                 qrencode -t ANSIUTF8 "https://ntfy.sh" | sed 's/^/  /'
 
-                # Subscribe
                 echo ""
-                echo -e "  ${BOLD}Step 2: Subscribe to alerts${NC}"
-                echo -e "  ${DIM}Open ntfy app, tap +, and enter this topic:${NC}"
+                echo -e "  ${BOLD}${CYAN}Step 2:${NC} ${BOLD}Subscribe to your alerts${NC}"
+                echo -e "  ${DIM}Open the ntfy app, tap ${NC}+${DIM}, and enter this topic:${NC}"
                 echo ""
-                echo -e "    ${YELLOW}${BOLD}$NTFY_TOPIC${NC}"
+                echo -e "      ${YELLOW}${BOLD}$NTFY_TOPIC${NC}"
                 echo ""
-                echo -e "  ${DIM}Keep this topic private - anyone with it can see alerts${NC}"
+                echo -e "  ${DIM}Keep this private - anyone with it can see your alerts${NC}"
                 echo ""
-                read -p "  Press Enter after subscribing to send a test notification... " _
+                read -p "  Press Enter after subscribing to send a test... " _
 
-                echo ""
                 step "Sending test notification..."
                 if curl -s -o /dev/null -w "%{http_code}" -d "disk-watchdog installed successfully!" "https://ntfy.sh/${NTFY_TOPIC}" | grep -q "200"; then
-                    success "Test notification sent! Check your phone."
+                    success "Test sent! Check your phone."
                 else
-                    error "Failed to send. Check your network connection."
+                    error "Failed to send. Check your network."
                 fi
             else
-                echo ""
                 info "To receive notifications:"
                 info "1. Install ntfy app: https://ntfy.sh"
                 info "2. Subscribe to topic: $NTFY_TOPIC"
             fi
         else
             info "Push notifications skipped"
+            info "You can enable later in /etc/disk-watchdog.conf"
         fi
     else
         # Non-interactive: use defaults
-        success "Monitoring all users (default)"
-        info "For push notifications, re-run with: --interactive"
+        success "Using default configuration"
+        info "Mount: /"
+        info "Monitoring: all users"
+        info "Push notifications: disabled"
+        info "For interactive setup, re-run with: --interactive"
     fi
 else
-    info "Config already exists, skipping"
+    info "Config already exists at /etc/disk-watchdog.conf"
+    info "Delete it and re-run to reconfigure"
 fi
 
 # Create state directory
@@ -298,26 +353,59 @@ mkdir -p /var/lib/disk-watchdog
 # ============================================================
 # STEP 4: Systemd
 # ============================================================
-header "4/4  Systemd"
+header "4/4  Finishing up"
 
 systemctl daemon-reload
-success "Reloaded systemd"
+success "Registered systemd service"
 
 # ============================================================
-# Done!
+# Summary & Next Steps
 # ============================================================
 echo ""
-echo -e "${GREEN}${BOLD}┌────────────────────────────────────────┐${NC}"
-echo -e "${GREEN}${BOLD}│         Installation complete!         │${NC}"
-echo -e "${GREEN}${BOLD}└────────────────────────────────────────┘${NC}"
+echo -e "${GREEN}${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
+echo -e "${GREEN}${BOLD}│              Installation complete!                     │${NC}"
+echo -e "${GREEN}${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
+
+if [[ "$INTERACTIVE" == "yes" ]]; then
+    echo ""
+    echo -e "  ${BOLD}Configuration summary:${NC}"
+    echo ""
+    echo -e "    Mount point:      ${CYAN}$CONFIG_MOUNT${NC}"
+    echo -e "    Monitoring:       ${CYAN}$CONFIG_USER${NC}"
+    echo -e "    Push alerts:      ${CYAN}$CONFIG_NOTIFY${NC}"
+    echo ""
+
+    # Show thresholds for the monitored mount
+    DISK_SIZE=$(df -BG "$CONFIG_MOUNT" 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$2); print $2}')
+    if [[ -n "$DISK_SIZE" ]] && [[ "$DISK_SIZE" -gt 0 ]]; then
+        echo -e "  ${BOLD}Auto-calculated thresholds for ${DISK_SIZE}GB disk:${NC}"
+        echo ""
+        # Calculate thresholds (matching disk-watchdog.sh logic)
+        NOTICE=$((DISK_SIZE * 10 / 100))
+        WARN=$((DISK_SIZE * 7 / 100))
+        HARSH=$((DISK_SIZE * 4 / 100))
+        PAUSE=$((DISK_SIZE * 2 / 100)); [[ $PAUSE -gt 30 ]] && PAUSE=30
+        STOP=$((DISK_SIZE * 1 / 100)); [[ $STOP -gt 15 ]] && STOP=15
+        KILL=$((DISK_SIZE * 5 / 1000)); [[ $KILL -gt 5 ]] && KILL=5; [[ $KILL -lt 1 ]] && KILL=1
+
+        echo -e "    ${DIM}< ${NOTICE}GB free${NC}  →  Notice (log only)"
+        echo -e "    ${DIM}< ${WARN}GB free${NC}  →  Warning (desktop notification)"
+        echo -e "    ${DIM}< ${HARSH}GB free${NC}  →  Harsh warning"
+        echo -e "    ${YELLOW}< ${PAUSE}GB free${NC}  →  ${YELLOW}SIGSTOP${NC} (pause processes)"
+        echo -e "    ${RED}< ${STOP}GB free${NC}  →  ${RED}SIGTERM${NC} (stop processes)"
+        echo -e "    ${RED}< ${KILL}GB free${NC}  →  ${RED}SIGKILL${NC} (force kill)"
+        echo ""
+    fi
+fi
+
+echo -e "  ${BOLD}Next steps:${NC}"
 echo ""
-echo -e "${BOLD}Next steps:${NC}"
+echo -e "    ${CYAN}1.${NC} Start the service:"
+echo -e "       ${DIM}sudo systemctl enable --now disk-watchdog${NC}"
 echo ""
-echo -e "  ${CYAN}1.${NC} Start the service:"
-echo -e "     ${DIM}sudo systemctl enable --now disk-watchdog${NC}"
+echo -e "    ${CYAN}2.${NC} Check current status:"
+echo -e "       ${DIM}sudo disk-watchdog status${NC}"
 echo ""
-echo -e "  ${CYAN}2.${NC} Check status:"
-echo -e "     ${DIM}sudo disk-watchdog status${NC}"
-echo ""
-echo -e "${DIM}Config: /etc/disk-watchdog.conf${NC}"
+echo -e "  ${DIM}Config file: /etc/disk-watchdog.conf${NC}"
+echo -e "  ${DIM}Logs: /var/log/disk-watchdog.log${NC}"
 echo ""
