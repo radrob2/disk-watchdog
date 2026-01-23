@@ -52,8 +52,13 @@ RATE_WARN_GB_PER_MIN="${DISK_WATCHDOG_RATE_WARN:-2}"
 # Smart mode: detect and kill actual heavy writers (vs predefined list)
 SMART_MODE="${DISK_WATCHDOG_SMART:-true}"
 
-# Minimum bytes written to consider a process a "heavy writer" (default 100MB)
+# Use biotop (eBPF) for real-time I/O detection if available
+USE_BIOTOP="${DISK_WATCHDOG_USE_BIOTOP:-auto}"
+BIOTOP_CMD="${DISK_WATCHDOG_BIOTOP_CMD:-biotop-bpfcc}"
+
+# Minimum bytes written to consider a process a "heavy writer" (default 100MB for /proc, 1MB for biotop)
 HEAVY_WRITER_THRESHOLD="${DISK_WATCHDOG_HEAVY_THRESHOLD:-104857600}"
+BIOTOP_THRESHOLD_KB="${DISK_WATCHDOG_BIOTOP_THRESHOLD:-1024}"
 
 # Fallback process patterns if smart mode fails
 PROC_PATTERNS="${DISK_WATCHDOG_PROCS:-fastp|kraken|dustmasker|bwa|spades|megahit|rsync|photorec|dd|cp|mv}"
@@ -223,7 +228,48 @@ calculate_rate() {
 # SMART WRITER DETECTION
 # =============================================================================
 
-get_heavy_writers() {
+# Check if biotop is available
+has_biotop() {
+    command -v "$BIOTOP_CMD" &>/dev/null
+}
+
+# Require biotop - fail fast if not available
+require_biotop() {
+    if ! has_biotop; then
+        die "biotop not found ($BIOTOP_CMD). Install with: sudo apt install bpfcc-tools"
+    fi
+}
+
+# Get the device name for a mount point (e.g., / -> nvme1n1)
+get_mount_device() {
+    local mount="$1"
+    # Remove /dev/, partition number, and trailing 'p' for nvme devices
+    df "$mount" 2>/dev/null | awk 'NR==2 {print $1}' | sed 's|/dev/||' | sed 's/p\?[0-9]*$//'
+}
+
+# Get heavy writers using biotop (eBPF) - real-time, accurate
+get_heavy_writers_biotop() {
+    local device
+    device=$(get_mount_device "$MOUNT_POINT")
+
+    # Run biotop for 1 second, get 1 sample
+    # Filter: writes only (W), to our disk, above threshold
+    "$BIOTOP_CMD" -C 1 1 2>/dev/null | \
+        awk -v dev="$device" -v thresh="$BIOTOP_THRESHOLD_KB" -v user="$TARGET_USER" '
+        NF >= 8 && $3 == "W" && $6 ~ dev && $7 >= thresh {
+            pid = $1
+            comm = $2
+            kbytes = $7
+            # Skip header line
+            if (pid ~ /^[0-9]+$/) {
+                print kbytes * 1024 ":" pid ":" comm
+            }
+        }
+        ' | sort -t: -k1 -rn | head -10
+}
+
+# Get heavy writers using /proc/pid/io (fallback - cumulative, less accurate)
+get_heavy_writers_proc() {
     local user_filter=""
     [[ -n "$TARGET_USER" ]] && user_filter="$TARGET_USER"
 
@@ -263,6 +309,11 @@ get_heavy_writers() {
 
     # Sort by write bytes descending and return top 10
     printf '%s\n' "${writers[@]}" 2>/dev/null | sort -t: -k1 -rn | head -10
+}
+
+# Main function to get heavy writers - uses biotop (required)
+get_heavy_writers() {
+    get_heavy_writers_biotop
 }
 
 format_bytes() {
@@ -451,15 +502,21 @@ cmd_status() {
     interval=$(get_check_interval "$free")
     state=$(read_state)
 
+    local biotop_status="not found"
+    has_biotop && biotop_status="$BIOTOP_CMD"
+
+    local device
+    device=$(get_mount_device "$MOUNT_POINT")
+
     echo "disk-watchdog v${VERSION}"
     echo ""
-    echo "Mount point:     $MOUNT_POINT"
+    echo "Mount point:     $MOUNT_POINT ($device)"
     echo "Free space:      ${free}GB"
     echo "Current level:   $level"
     echo "Saved state:     $state"
     echo "Check interval:  ${interval}s"
     echo "Target user:     ${TARGET_USER:-any}"
-    echo "Smart mode:      $SMART_MODE"
+    echo "I/O detection:   $biotop_status (eBPF real-time)"
     echo "Dry run:         $DRY_RUN"
     echo ""
     echo "Thresholds:"
@@ -470,17 +527,20 @@ cmd_status() {
     echo "  Stop:   <${THRESH_STOP}GB (SIGTERM)"
     echo "  Kill:   <${THRESH_KILL}GB (SIGKILL)"
     echo ""
+    echo "Currently writing to $device (real-time via eBPF):"
 
-    if [[ "$SMART_MODE" == "true" ]]; then
-        echo "Top disk writers (${TARGET_USER:-all users}):"
-        local count=0
-        while IFS=: read -r bytes pid comm; do
-            [[ -z "$pid" ]] && continue
-            printf "  %10s - %s (PID %s)\n" "$(format_bytes "$bytes")" "$comm" "$pid"
-            (( ++count >= 5 )) && break
-        done < <(get_heavy_writers)
-        [[ $count -eq 0 ]] && echo "  (none detected)"
+    if ! has_biotop; then
+        echo "  (biotop not available - install bpfcc-tools)"
+        return 0
     fi
+
+    local count=0
+    while IFS=: read -r bytes pid comm; do
+        [[ -z "$pid" ]] && continue
+        printf "  %10s/s - %s (PID %s)\n" "$(format_bytes "$bytes")" "$comm" "$pid"
+        (( ++count >= 5 )) && break
+    done < <(get_heavy_writers)
+    [[ $count -eq 0 ]] && echo "  (no active writers detected)"
     return 0
 }
 
@@ -519,6 +579,9 @@ cmd_writers() {
 }
 
 cmd_run() {
+    # Require biotop
+    require_biotop
+
     # Check for existing instance
     if [[ -f "$PID_FILE" ]]; then
         local old_pid
