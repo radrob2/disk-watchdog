@@ -25,7 +25,13 @@ readonly SCRIPT_NAME="disk-watchdog"
 # =============================================================================
 
 CONFIG_FILE="${DISK_WATCHDOG_CONFIG:-/etc/disk-watchdog.conf}"
-[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+if [[ -f "$CONFIG_FILE" ]]; then
+    # Security check: warn if config is world-writable (potential code injection vector)
+    if [[ -w "$CONFIG_FILE" ]] && [[ "$(stat -c %a "$CONFIG_FILE" 2>/dev/null)" =~ [2367]$ ]]; then
+        echo "[SECURITY WARNING] Config file $CONFIG_FILE is world-writable. Fix with: chmod 644 $CONFIG_FILE" >&2
+    fi
+    source "$CONFIG_FILE"
+fi
 
 # Paths
 MOUNT_POINT="${DISK_WATCHDOG_MOUNT:-/}"
@@ -259,16 +265,6 @@ notify_desktop() {
     local title="$2"
     local msg="$3"
 
-    # Sanitize inputs to prevent command injection (remove quotes and special chars)
-    title="${title//\'/}"
-    title="${title//\"/}"
-    title="${title//\`/}"
-    title="${title//\$/}"
-    msg="${msg//\'/}"
-    msg="${msg//\"/}"
-    msg="${msg//\`/}"
-    msg="${msg//\$/}"
-
     # Determine which user to notify
     local notify_user="$TARGET_USER"
     if [[ -z "$notify_user" ]]; then
@@ -287,18 +283,18 @@ notify_desktop() {
     user_uid=$(id -u "$notify_user" 2>/dev/null) || return 0
     local runtime_dir="/run/user/$user_uid"
 
-    # Try Wayland first (modern systems), then X11
-    # Use 'su' without '-' to avoid slow login shell
+    # Use runuser with explicit arguments to avoid shell injection
+    # Arguments are passed directly to notify-send, not through shell interpolation
     if [[ -d "$runtime_dir" ]]; then
-        # Wayland
-        su "$notify_user" -s /bin/sh -c \
-            "XDG_RUNTIME_DIR='$runtime_dir' notify-send -u '$urgency' '$title' '$msg'" 2>/dev/null && return 0
+        # Wayland - use env to set XDG_RUNTIME_DIR safely
+        runuser -u "$notify_user" -- env "XDG_RUNTIME_DIR=$runtime_dir" \
+            notify-send -u "$urgency" -- "$title" "$msg" 2>/dev/null && return 0
     fi
 
     # X11 fallback
     for display in :0 :1; do
-        su "$notify_user" -s /bin/sh -c \
-            "DISPLAY=$display notify-send -u '$urgency' '$title' '$msg'" 2>/dev/null && return 0
+        runuser -u "$notify_user" -- env "DISPLAY=$display" \
+            notify-send -u "$urgency" -- "$title" "$msg" 2>/dev/null && return 0
     done
 
     return 1
@@ -1291,9 +1287,11 @@ cmd_run() {
     # Require biotop
     require_biotop
 
-    # Setup directories first
+    # Setup directories with restrictive permissions
     mkdir -p "$STATE_DIR" 2>/dev/null || die "Cannot create state directory: $STATE_DIR"
+    chmod 0700 "$STATE_DIR" 2>/dev/null || true
     touch "$LOG_FILE" 2>/dev/null || die "Cannot write to log file: $LOG_FILE"
+    chmod 0600 "$LOG_FILE" 2>/dev/null || true
 
     # Acquire exclusive lock (prevents race condition)
     exec 200>"$PID_FILE"
@@ -1307,7 +1305,7 @@ cmd_run() {
     # Signal handlers
     trap 'log_msg "INFO" "Received SIGTERM, shutting down"; rm -f "$PID_FILE"; exit 0' SIGTERM
     trap 'log_msg "INFO" "Received SIGINT, shutting down"; rm -f "$PID_FILE"; exit 0' SIGINT
-    trap 'log_msg "INFO" "Received SIGHUP, reloading config"; [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"; init_thresholds' SIGHUP
+    trap 'log_msg "INFO" "Received SIGHUP, reloading config"; [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"; validate_config && init_thresholds || log_msg "ERROR" "Config validation failed after reload"' SIGHUP
 
     log_msg "INFO" "$SCRIPT_NAME v${VERSION} started (PID $$)"
     log_msg "INFO" "Config: mount=$MOUNT_POINT user=${TARGET_USER:-any} smart=$SMART_MODE dry_run=$DRY_RUN"

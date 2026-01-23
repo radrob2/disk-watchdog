@@ -1,6 +1,6 @@
 [Unit]
 Description=Adaptive Disk Space Watchdog
-Documentation=https://github.com/radrob/disk-watchdog
+Documentation=https://github.com/radrob2/disk-watchdog
 After=network.target local-fs.target
 
 [Service]
@@ -10,15 +10,14 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=10
 
-# Systemd watchdog: if script doesn't respond in 60s, restart it
-WatchdogSec=60
-
 # Hardening
 ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/var/log /tmp /run /var/lib/disk-watchdog
-NoNewPrivileges=false
+ProtectHome=true
+ReadWritePaths=/var/log /var/lib/disk-watchdog /run
 PrivateTmp=true
+NoNewPrivileges=true
+
+# Note: No WatchdogSec because main loop has adaptive sleep intervals (1s-300s)
 
 [Install]
 WantedBy=multi-user.target
