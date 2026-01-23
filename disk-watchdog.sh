@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly SCRIPT_NAME="disk-watchdog"
 
 # =============================================================================
@@ -775,10 +775,11 @@ get_heavy_writers_biotop() {
     device=$(get_mount_device "$MOUNT_POINT")
 
     # Run biotop for 1 second, get 1 sample
-    # Filter: writes only (W), to our disk, above threshold
+    # Filter: any I/O to our disk above threshold (biotop sometimes shows writes as R)
+    # Exclude PID 0 (kernel writeback threads)
     "$BIOTOP_CMD" -C 1 1 2>/dev/null | \
         awk -v dev="$device" -v thresh="$BIOTOP_THRESHOLD_KB" '
-        NF >= 8 && $3 == "W" && $6 ~ dev && $7 >= thresh {
+        NF >= 8 && $1 != 0 && $6 ~ dev && $7 >= thresh {
             pid = $1
             comm = $2
             kbytes = $7
@@ -849,21 +850,99 @@ get_heavy_writers_proc() {
     printf '%s\n' "${writers[@]}" 2>/dev/null | sort -t: -k1 -rn | head -10
 }
 
-# Main function to get heavy writers - combines real-time biotop + tracked writers
+# Get CURRENT write rates by sampling twice (more accurate than cumulative)
+# Args: $1 = sample interval in seconds (default 2)
+# Returns: bytes_per_sec:pid:comm for processes with write rate > 1MB/s
+get_write_rates() {
+    local interval="${1:-2}"
+    local min_rate=1048576  # 1MB/s minimum to report
+
+    local user_filter=""
+    [[ -n "$TARGET_USER" ]] && user_filter="$TARGET_USER"
+
+    declare -A sample1
+    declare -A comms
+
+    # First sample
+    while IFS= read -r proc_dir; do
+        [[ -r "$proc_dir/io" && -r "$proc_dir/comm" ]] || continue
+        local pid="${proc_dir##*/}"
+
+        # Check user ownership
+        if [[ -n "$user_filter" ]]; then
+            local proc_user
+            proc_user=$(stat -c %U "$proc_dir" 2>/dev/null) || continue
+            [[ "$proc_user" != "$user_filter" ]] && continue
+        fi
+
+        local comm
+        comm=$(tr -d '\0' < "$proc_dir/comm" 2>/dev/null) || continue
+
+        # Skip protected
+        echo "$comm" | grep -qE "^($PROTECTED_PROCS)$" && continue
+
+        local write_bytes
+        write_bytes=$(awk -F': ' '/^write_bytes:/{print $2; exit}' "$proc_dir/io" 2>/dev/null) || continue
+        [[ -z "$write_bytes" ]] && continue
+
+        sample1[$pid]=$write_bytes
+        comms[$pid]=$comm
+    done < <(find /proc -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null)
+
+    # Wait
+    sleep "$interval"
+
+    # Second sample and calculate rates
+    local writers=()
+    while IFS= read -r proc_dir; do
+        [[ -r "$proc_dir/io" ]] || continue
+        local pid="${proc_dir##*/}"
+
+        # Only check PIDs we saw in first sample
+        [[ -z "${sample1[$pid]:-}" ]] && continue
+
+        local write_bytes
+        write_bytes=$(awk -F': ' '/^write_bytes:/{print $2; exit}' "$proc_dir/io" 2>/dev/null) || continue
+        [[ -z "$write_bytes" ]] && continue
+
+        local delta=$(( write_bytes - sample1[$pid] ))
+        (( delta <= 0 )) && continue
+
+        local rate=$(( delta / interval ))
+        (( rate < min_rate )) && continue
+
+        writers+=("$rate:$pid:${comms[$pid]}")
+    done < <(find /proc -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null)
+
+    # Sort by rate descending
+    printf '%s\n' "${writers[@]}" 2>/dev/null | sort -t: -k1 -rn | head -10
+}
+
+# Main function to get heavy writers - combines biotop + /proc/pid/io + tracked writers
 get_heavy_writers() {
-    # Get current writers from biotop
-    local current_writers
-    current_writers=$(get_heavy_writers_biotop)
+    # Get current writers from biotop (real-time, but may miss page cache writes)
+    local biotop_writers
+    biotop_writers=$(get_heavy_writers_biotop)
+
+    # Get writers from /proc/pid/io (cumulative, catches what biotop misses)
+    local proc_writers
+    proc_writers=$(get_heavy_writers_proc)
 
     # Track any new writers we find
     while IFS=: read -r bytes pid comm; do
         [[ -z "$pid" ]] && continue
         track_writer "$pid" "$comm" "$bytes"
-    done <<< "$current_writers"
+    done <<< "$biotop_writers"
 
-    # Merge current writers with tracked writers (in case biotop missed some)
+    while IFS=: read -r bytes pid comm; do
+        [[ -z "$pid" ]] && continue
+        track_writer "$pid" "$comm" "$bytes"
+    done <<< "$proc_writers"
+
+    # Merge all sources, dedupe by PID, return top 10
     {
-        echo "$current_writers"
+        echo "$biotop_writers"
+        echo "$proc_writers"
         get_tracked_writers
     } | sort -t: -k1 -rn | awk -F: '!seen[$2]++' | head -10
 }
@@ -1131,20 +1210,24 @@ cmd_status() {
         fi
     fi
     echo ""
-    echo "Currently writing to $device (real-time via eBPF):"
-
-    if ! has_biotop; then
-        echo "  (biotop not available - install bpfcc-tools)"
-        return 0
-    fi
-
+    echo "Currently writing (sampled over 2s):"
     local count=0
+    while IFS=: read -r rate pid comm; do
+        [[ -z "$pid" ]] && continue
+        printf "  %10s/s - %s (PID %s)\n" "$(format_bytes "$rate")" "$comm" "$pid"
+        (( ++count >= 5 )) && break
+    done < <(get_write_rates 2)
+    [[ $count -eq 0 ]] && echo "  (no active writers >1MB/s)"
+
+    echo ""
+    echo "Heavy writers (cumulative total):"
+    count=0
     while IFS=: read -r bytes pid comm; do
         [[ -z "$pid" ]] && continue
-        printf "  %10s/s - %s (PID %s)\n" "$(format_bytes "$bytes")" "$comm" "$pid"
+        printf "  %10s - %s (PID %s)\n" "$(format_bytes "$bytes")" "$comm" "$pid"
         (( ++count >= 5 )) && break
     done < <(get_heavy_writers)
-    [[ $count -eq 0 ]] && echo "  (no active writers detected)"
+    [[ $count -eq 0 ]] && echo "  (none above threshold)"
     return 0
 }
 
