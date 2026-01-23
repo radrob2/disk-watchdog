@@ -227,17 +227,31 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
         # --- Mount Point ---
         subheader "Which disk to monitor?"
         echo ""
-        echo -e "  ${DIM}Current mount points:${NC}"
-        df -h --output=target,size,avail,pcent -x tmpfs -x devtmpfs 2>/dev/null | head -6 | tail -5 | while read line; do
-            echo -e "    ${DIM}$line${NC}"
+
+        # Get mount points into an array
+        mapfile -t MOUNTS < <(df -h --output=target,size,avail,pcent -x tmpfs -x devtmpfs -x efivarfs -x overlay 2>/dev/null | tail -n +2 | head -10)
+
+        # Display numbered options
+        i=1
+        for mount_line in "${MOUNTS[@]}"; do
+            mount_path=$(echo "$mount_line" | awk '{print $1}')
+            mount_info=$(echo "$mount_line" | awk '{print $2 " total, " $3 " free (" $4 " used)"}')
+            if [[ "$mount_path" == "/" ]]; then
+                echo -e "    ${CYAN}$i${NC})  $mount_path ${DIM}$mount_info${NC} ${DIM}(default)${NC}"
+            else
+                echo -e "    ${CYAN}$i${NC})  $mount_path ${DIM}$mount_info${NC}"
+            fi
+            ((i++))
         done
         echo ""
-        read -p "  Mount point to monitor (default: /): " mount_choice
+        read -p "  Choose [1-$((i-1))] (default: 1): " mount_choice
 
-        if [[ -n "$mount_choice" ]] && [[ -d "$mount_choice" ]]; then
-            sed -i "s|^DISK_WATCHDOG_MOUNT=.*|DISK_WATCHDOG_MOUNT=$mount_choice|" /etc/disk-watchdog.conf
-            CONFIG_MOUNT="$mount_choice"
-            success "Monitoring: $mount_choice"
+        # Parse selection
+        if [[ -n "$mount_choice" ]] && [[ "$mount_choice" =~ ^[0-9]+$ ]] && [[ "$mount_choice" -ge 1 ]] && [[ "$mount_choice" -le "${#MOUNTS[@]}" ]]; then
+            selected_mount=$(echo "${MOUNTS[$((mount_choice-1))]}" | awk '{print $1}')
+            sed -i "s|^DISK_WATCHDOG_MOUNT=.*|DISK_WATCHDOG_MOUNT=$selected_mount|" /etc/disk-watchdog.conf
+            CONFIG_MOUNT="$selected_mount"
+            success "Monitoring: $selected_mount"
         else
             success "Monitoring: / (default)"
         fi
