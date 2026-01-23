@@ -2,7 +2,7 @@
 # disk-watchdog installer
 set -euo pipefail
 
-REPO_URL="https://raw.githubusercontent.com/radrob/disk-watchdog/main"
+REPO_URL="https://raw.githubusercontent.com/radrob/disk-watchdog/master"
 
 echo "========================================"
 echo "  disk-watchdog installer"
@@ -14,6 +14,34 @@ if [[ $EUID -ne 0 ]]; then
     echo "Error: This installer must be run as root (sudo)."
     exit 1
 fi
+
+# Check for curl or wget
+if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+    echo "Installing curl..."
+    if command -v apt &>/dev/null; then
+        apt update -qq && apt install -y -qq curl
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q curl
+    elif command -v yum &>/dev/null; then
+        yum install -y -q curl
+    elif command -v pacman &>/dev/null; then
+        pacman -Sy --noconfirm curl
+    else
+        echo "Error: curl or wget required. Please install manually."
+        exit 1
+    fi
+fi
+
+# Download helper function (supports curl or wget)
+download() {
+    local url="$1"
+    local dest="$2"
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$url" -o "$dest"
+    else
+        wget -q "$url" -O "$dest"
+    fi
+}
 
 # Detect package manager
 if command -v apt &>/dev/null; then
@@ -64,18 +92,18 @@ echo "    Using: $BIOTOP_CMD"
 # Download files
 echo ""
 echo "[2/4] Downloading disk-watchdog..."
-curl -fsSL "$REPO_URL/disk-watchdog.sh" -o /usr/local/bin/disk-watchdog
+download "$REPO_URL/disk-watchdog.sh" /usr/local/bin/disk-watchdog
 chmod +x /usr/local/bin/disk-watchdog
 echo "    Installed /usr/local/bin/disk-watchdog"
 
-curl -fsSL "$REPO_URL/disk-watchdog.service" -o /etc/systemd/system/disk-watchdog.service
+download "$REPO_URL/disk-watchdog.service" /etc/systemd/system/disk-watchdog.service
 echo "    Installed /etc/systemd/system/disk-watchdog.service"
 
 # Install config if not exists
 echo ""
 echo "[3/4] Configuring..."
 if [[ ! -f /etc/disk-watchdog.conf ]]; then
-    curl -fsSL "$REPO_URL/disk-watchdog.conf" -o /etc/disk-watchdog.conf
+    download "$REPO_URL/disk-watchdog.conf" /etc/disk-watchdog.conf
 
     # Set biotop command
     sed -i "s|# DISK_WATCHDOG_BIOTOP_CMD=.*|DISK_WATCHDOG_BIOTOP_CMD=$BIOTOP_CMD|" /etc/disk-watchdog.conf
@@ -121,9 +149,9 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
         NTFY_TOPIC="disk-watchdog-$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 8)"
         NTFY_URL="https://ntfy.sh/${NTFY_TOPIC}"
 
-        # Update config
+        # Update config - only replace the ntfy example line, leave others as examples
         sed -i "s|^DISK_WATCHDOG_WEBHOOK=.*|DISK_WATCHDOG_WEBHOOK=true|" /etc/disk-watchdog.conf
-        sed -i "s|^# DISK_WATCHDOG_WEBHOOK_URL=.*|DISK_WATCHDOG_WEBHOOK_URL=${NTFY_URL}|" /etc/disk-watchdog.conf
+        sed -i "s|^# DISK_WATCHDOG_WEBHOOK_URL=https://ntfy.sh/.*|DISK_WATCHDOG_WEBHOOK_URL=${NTFY_URL}|" /etc/disk-watchdog.conf
 
         echo ""
         echo "    Push notifications enabled!"
