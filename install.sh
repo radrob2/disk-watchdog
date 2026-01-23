@@ -413,15 +413,33 @@ if [[ "$INTERACTIVE" == "yes" ]]; then
         echo -e "    ${RED}< ${KILL}GB free${NC}  →  ${RED}SIGKILL${NC} (force kill)"
         echo ""
     fi
-fi
 
-echo -e "  ${BOLD}Next steps:${NC}"
-echo ""
-echo -e "    ${CYAN}1.${NC} Start the service:"
-echo -e "       ${DIM}sudo systemctl enable --now disk-watchdog${NC}"
-echo ""
-echo -e "    ${CYAN}2.${NC} Check current status:"
-echo -e "       ${DIM}sudo disk-watchdog status${NC}"
+    # Offer to start the service
+    echo ""
+    read -p "  Start disk-watchdog now? [Y/n]: " start_now
+
+    if [[ ! "$start_now" =~ ^[Nn] ]]; then
+        step "Starting disk-watchdog..."
+        systemctl enable --now disk-watchdog
+        success "Service started and enabled on boot"
+        echo ""
+        echo -e "  ${BOLD}Check status:${NC}"
+        echo -e "     ${DIM}sudo disk-watchdog status${NC}"
+    else
+        echo ""
+        echo -e "  ${BOLD}To start later:${NC}"
+        echo -e "     ${DIM}sudo systemctl enable --now disk-watchdog${NC}"
+    fi
+else
+    echo ""
+    echo -e "  ${BOLD}Next steps:${NC}"
+    echo ""
+    echo -e "    ${CYAN}1.${NC} Start the service:"
+    echo -e "       ${DIM}sudo systemctl enable --now disk-watchdog${NC}"
+    echo ""
+    echo -e "    ${CYAN}2.${NC} Check current status:"
+    echo -e "       ${DIM}sudo disk-watchdog status${NC}"
+fi
 echo ""
 echo -e "  ${DIM}Config file: /etc/disk-watchdog.conf${NC}"
 echo -e "  ${DIM}Logs: /var/log/disk-watchdog.log${NC}"
