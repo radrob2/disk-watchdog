@@ -7,6 +7,7 @@ REPO_URL="https://raw.githubusercontent.com/radrob2/disk-watchdog/master"
 
 # If piped (curl|bash), re-download and exec with terminal access
 if [[ ! -t 0 ]]; then
+    echo "Downloading installer..."
     TMPSCRIPT=$(mktemp)
     trap "rm -f '$TMPSCRIPT'" EXIT
     if command -v curl &>/dev/null; then
@@ -17,6 +18,7 @@ if [[ ! -t 0 ]]; then
         echo "Error: curl or wget required."
         exit 1
     fi
+    echo "Starting interactive installer..."
     chmod +x "$TMPSCRIPT"
     exec bash "$TMPSCRIPT" "$@" </dev/tty
 fi
