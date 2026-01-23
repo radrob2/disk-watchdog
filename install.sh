@@ -81,12 +81,12 @@ fi
 
 # Banner
 echo ""
-echo -e "${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
-echo -e "${BOLD}│              ${CYAN}disk-watchdog${NC} ${BOLD}installer                    │${NC}"
+echo -e "${BOLD}┌───────────────────────────────────────────┐${NC}"
+echo -e "${BOLD}│       ${CYAN}disk-watchdog${NC}${BOLD} installer           │${NC}"
 if [[ "$INTERACTIVE" == "yes" ]]; then
-echo -e "${BOLD}│                ${DIM}interactive mode${NC}${BOLD}                        │${NC}"
+echo -e "${BOLD}│         ${DIM}interactive mode${NC}${BOLD}                 │${NC}"
 fi
-echo -e "${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
+echo -e "${BOLD}└───────────────────────────────────────────┘${NC}"
 
 # Show what disk-watchdog does in interactive mode
 if [[ "$INTERACTIVE" == "yes" ]]; then
@@ -377,9 +377,9 @@ success "Registered systemd service"
 # Summary & Next Steps
 # ============================================================
 echo ""
-echo -e "${GREEN}${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
-echo -e "${GREEN}${BOLD}│              Installation complete!                     │${NC}"
-echo -e "${GREEN}${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
+echo -e "${GREEN}${BOLD}┌───────────────────────────────────────────┐${NC}"
+echo -e "${GREEN}${BOLD}│        Installation complete!             │${NC}"
+echo -e "${GREEN}${BOLD}└───────────────────────────────────────────┘${NC}"
 
 if [[ "$INTERACTIVE" == "yes" ]]; then
     echo ""
