@@ -200,12 +200,19 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
             echo ""
             echo "    ┌─────────────────────────────────────────────────────┐"
             echo "    │  STEP 2: Subscribe in the ntfy app                  │"
-            echo "    │  Add this topic: $NTFY_TOPIC"
+            echo "    │  Tap + and enter topic: $NTFY_TOPIC"
             echo "    └─────────────────────────────────────────────────────┘"
             echo ""
-            echo "    Keep this topic private - anyone with it can subscribe."
+            echo "    (Keep this topic private - anyone with it can see alerts)"
             echo ""
-            read -p "    Press Enter after subscribing in the ntfy app... " _
+            read -p "    Press Enter after subscribing, to send a test notification... " _
+            echo ""
+            echo "    Sending test notification..."
+            if curl -s -o /dev/null -w "%{http_code}" -d "disk-watchdog installed successfully! 🎉" "https://ntfy.sh/${NTFY_TOPIC}" | grep -q "200"; then
+                echo "    ✓ Test notification sent! Check your phone."
+            else
+                echo "    ✗ Failed to send test notification. Check your network."
+            fi
         else
             echo ""
             echo "    To receive notifications:"
