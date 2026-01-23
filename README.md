@@ -31,17 +31,20 @@ Adaptive disk space monitor that checks more frequently as your disk fills up, a
 
 ```bash
 # One-liner install (requires root)
-curl -fsSL https://raw.githubusercontent.com/radrob/disk-watchdog/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/radrob/disk-watchdog/master/install.sh | sudo bash
+```
 
-# Or manual install:
+The installer will:
+- Install eBPF tools (bpfcc-tools) automatically
+- Ask if you want to monitor all users or a specific user
+- Optionally set up push notifications to your phone (ntfy.sh) with QR codes
+- Configure and start the systemd service
+
+**Manual install:**
+```bash
 git clone https://github.com/radrob/disk-watchdog
 cd disk-watchdog
-sudo cp disk-watchdog.sh /usr/local/bin/disk-watchdog
-sudo chmod +x /usr/local/bin/disk-watchdog
-sudo cp disk-watchdog.conf /etc/
-sudo cp disk-watchdog.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now disk-watchdog
+sudo ./install.sh
 ```
 
 ## Usage
@@ -158,6 +161,36 @@ pkill -CONT -u $USER
 kill -CONT <PID>
 ```
 
+## Push Notifications
+
+Get alerts on your phone via [ntfy.sh](https://ntfy.sh) (free, no account required):
+
+```bash
+# Set up during install, or manually:
+sudo nano /etc/disk-watchdog.conf
+
+# Add:
+DISK_WATCHDOG_WEBHOOK=true
+DISK_WATCHDOG_WEBHOOK_URL=https://ntfy.sh/your-unique-topic
+
+# Then subscribe to that topic in the ntfy app
+```
+
+Also supports Slack and Discord webhooks.
+
+## Testing
+
+```bash
+# Test notifications without taking action
+sudo disk-watchdog test
+
+# Test a specific level
+sudo disk-watchdog test harsh
+
+# Dry-run mode (logs but doesn't stop processes)
+sudo disk-watchdog --dry-run run
+```
+
 ## Logs
 
 ```bash
@@ -170,19 +203,23 @@ sudo systemctl status disk-watchdog
 
 ## How It Compares
 
-| Tool | Monitors | Adaptive | Smart Detection | SIGSTOP |
-|------|----------|----------|-----------------|---------|
-| `earlyoom` | Memory | No | N/A | No |
-| `monit` | Disk/CPU/etc | No | No | No |
-| `disk-watchdog` | Disk | **Yes** | **Yes** | **Yes** |
+| Feature | earlyoom | monit | disk-watchdog |
+|---------|----------|-------|---------------|
+| Monitors | Memory | Disk/CPU/etc | Disk |
+| Adaptive intervals | No | No | **Yes** |
+| Real-time I/O (eBPF) | N/A | No | **Yes** |
+| SIGSTOP (pause) | No | No | **Yes** |
+| Rate-aware escalation | No | No | **Yes** |
+| Push notifications | No | Email | **Yes** |
+| Auto thresholds | No | No | **Yes** |
 
 ## Troubleshooting
 
 **"Cannot create state directory"** - Run as root or with sudo for the daemon.
 
-**Desktop notifications not working** - Make sure `DISK_WATCHDOG_USER` is set and `notify-send` is installed.
+**Desktop notifications not working** - The watchdog auto-detects the GUI user. Make sure someone is logged in with a display.
 
-**Processes not being detected** - Check that `DISK_WATCHDOG_USER` matches the user running the processes.
+**Processes not being detected** - Run `sudo disk-watchdog writers` to see what biotop detects. Make sure you're writing to the monitored mount point.
 
 ## License
 
