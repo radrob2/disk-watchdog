@@ -5,6 +5,22 @@ set -euo pipefail
 
 REPO_URL="https://raw.githubusercontent.com/radrob2/disk-watchdog/master"
 
+# If piped (curl|bash), re-download and exec with terminal access
+if [[ ! -t 0 ]]; then
+    TMPSCRIPT=$(mktemp)
+    trap "rm -f '$TMPSCRIPT'" EXIT
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$REPO_URL/install-interactive.sh" -o "$TMPSCRIPT"
+    elif command -v wget &>/dev/null; then
+        wget -q "$REPO_URL/install-interactive.sh" -O "$TMPSCRIPT"
+    else
+        echo "Error: curl or wget required."
+        exit 1
+    fi
+    chmod +x "$TMPSCRIPT"
+    exec bash "$TMPSCRIPT" "$@"
+fi
+
 echo "========================================"
 echo "  disk-watchdog installer (interactive)"
 echo "========================================"

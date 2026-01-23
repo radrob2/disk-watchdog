@@ -38,8 +38,7 @@ This installs with sensible defaults (monitors all users, no push notifications)
 
 **Interactive install** (for push notifications setup with QR codes):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/radrob2/disk-watchdog/master/install-interactive.sh -o /tmp/install.sh
-sudo bash /tmp/install.sh
+curl -fsSL https://raw.githubusercontent.com/radrob2/disk-watchdog/master/install-interactive.sh | sudo bash
 ```
 
 **Manual install:**
