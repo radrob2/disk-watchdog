@@ -199,15 +199,11 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
             qrencode -t ANSIUTF8 "https://ntfy.sh" | sed 's/^/    /'
             echo ""
             echo "    ┌─────────────────────────────────────────────────────┐"
-            echo "    │  STEP 2: Subscribe to your alerts                   │"
-            echo "    │  Scan with your phone camera (ntfy app must be installed) │"
+            echo "    │  STEP 2: Subscribe in the ntfy app                  │"
+            echo "    │  Add this topic: $NTFY_TOPIC"
             echo "    └─────────────────────────────────────────────────────┘"
             echo ""
-            # Use ntfy:// deep link for auto-subscribe in the app
-            qrencode -t ANSIUTF8 "ntfy://ntfy.sh/${NTFY_TOPIC}" | sed 's/^/    /'
-            echo ""
-            echo "    Your topic: $NTFY_TOPIC"
-            echo "    Keep this private - anyone with the topic can subscribe."
+            echo "    Keep this topic private - anyone with it can subscribe."
             echo ""
             read -p "    Press Enter after subscribing in the ntfy app... " _
         else
