@@ -115,15 +115,15 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
     echo "    1) All users (recommended) - catches any runaway process"
     echo "    2) Specific user only - only manages one user's processes"
     echo ""
-    read -p "    Choose [1/2] (default: 1): " monitor_choice
+    read -p "    Choose [1/2] (default: 1): " monitor_choice </dev/tty
 
     if [[ "$monitor_choice" == "2" ]]; then
         # Get the user who invoked sudo (not root)
         REAL_USER="${SUDO_USER:-}"
         if [[ -z "$REAL_USER" ]]; then
-            read -p "    Enter username to monitor: " REAL_USER
+            read -p "    Enter username to monitor: " REAL_USER </dev/tty
         else
-            read -p "    Enter username to monitor (default: $REAL_USER): " input_user
+            read -p "    Enter username to monitor (default: $REAL_USER): " input_user </dev/tty
             [[ -n "$input_user" ]] && REAL_USER="$input_user"
         fi
 
@@ -142,7 +142,7 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
     echo "    Do you want push notifications to your phone?"
     echo "    (Uses ntfy.sh - free, no account required)"
     echo ""
-    read -p "    Enable push notifications? [y/N]: " enable_ntfy
+    read -p "    Enable push notifications? [y/N]: " enable_ntfy </dev/tty
 
     if [[ "$enable_ntfy" =~ ^[Yy] ]]; then
         # Generate random topic name
@@ -189,7 +189,7 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
             echo "    Your topic: $NTFY_TOPIC"
             echo "    Keep this private - anyone with the topic can subscribe."
             echo ""
-            read -p "    Press Enter after subscribing in the ntfy app... " _
+            read -p "    Press Enter after subscribing in the ntfy app... " _ </dev/tty
         else
             echo ""
             echo "    To receive notifications:"
