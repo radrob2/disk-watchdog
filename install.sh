@@ -1,25 +1,9 @@
 #!/bin/bash
-# disk-watchdog installer
+# disk-watchdog installer (non-interactive)
+# For interactive setup with push notifications, use install-interactive.sh
 set -euo pipefail
 
 REPO_URL="https://raw.githubusercontent.com/radrob2/disk-watchdog/master"
-
-# If stdin is not a terminal (piped), re-download and exec properly
-if [[ ! -t 0 ]]; then
-    # Download to temp file and re-exec with terminal access
-    TMPSCRIPT=$(mktemp)
-    if command -v curl &>/dev/null; then
-        curl -fsSL "$REPO_URL/install.sh" -o "$TMPSCRIPT"
-    elif command -v wget &>/dev/null; then
-        wget -q "$REPO_URL/install.sh" -O "$TMPSCRIPT"
-    else
-        echo "Error: curl or wget required."
-        exit 1
-    fi
-    chmod +x "$TMPSCRIPT"
-    exec bash "$TMPSCRIPT" "$@"
-    # exec replaces this process, so we never reach here
-fi
 
 echo "========================================"
 echo "  disk-watchdog installer"
@@ -125,96 +109,8 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
     # Set biotop command
     sed -i "s|# DISK_WATCHDOG_BIOTOP_CMD=.*|DISK_WATCHDOG_BIOTOP_CMD=$BIOTOP_CMD|" /etc/disk-watchdog.conf
 
-    # Ask about monitoring scope
-    echo ""
-    echo "    Which processes should disk-watchdog monitor?"
-    echo ""
-    echo "    1) All users (recommended) - catches any runaway process"
-    echo "    2) Specific user only - only manages one user's processes"
-    echo ""
-    read -p "    Choose [1/2] (default: 1): " monitor_choice
-
-    if [[ "$monitor_choice" == "2" ]]; then
-        # Get the user who invoked sudo (not root)
-        REAL_USER="${SUDO_USER:-}"
-        if [[ -z "$REAL_USER" ]]; then
-            read -p "    Enter username to monitor: " REAL_USER
-        else
-            read -p "    Enter username to monitor (default: $REAL_USER): " input_user
-            [[ -n "$input_user" ]] && REAL_USER="$input_user"
-        fi
-
-        if [[ -n "$REAL_USER" ]]; then
-            sed -i "s|^DISK_WATCHDOG_USER=.*|DISK_WATCHDOG_USER=$REAL_USER|" /etc/disk-watchdog.conf
-            echo "    Configured to monitor user: $REAL_USER"
-        fi
-    else
-        echo "    Configured to monitor all users"
-    fi
-
+    echo "    Configured to monitor all users (default)"
     echo "    Created /etc/disk-watchdog.conf"
-
-    # Ask about push notifications
-    echo ""
-    echo "    Do you want push notifications to your phone?"
-    echo "    (Uses ntfy.sh - free, no account required)"
-    echo ""
-    read -p "    Enable push notifications? [y/N]: " enable_ntfy
-
-    if [[ "$enable_ntfy" =~ ^[Yy] ]]; then
-        # Generate random topic name
-        NTFY_TOPIC="disk-watchdog-$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 8)"
-        NTFY_URL="https://ntfy.sh/${NTFY_TOPIC}"
-
-        # Update config - only replace the ntfy example line, leave others as examples
-        sed -i "s|^DISK_WATCHDOG_WEBHOOK=.*|DISK_WATCHDOG_WEBHOOK=true|" /etc/disk-watchdog.conf
-        sed -i "s|^# DISK_WATCHDOG_WEBHOOK_URL=https://ntfy.sh/.*|DISK_WATCHDOG_WEBHOOK_URL=${NTFY_URL}|" /etc/disk-watchdog.conf
-
-        echo ""
-        echo "    Push notifications enabled!"
-        echo "    Topic: $NTFY_TOPIC"
-        echo "    URL: $NTFY_URL"
-        echo ""
-
-        # Check for qrencode
-        if ! command -v qrencode &>/dev/null; then
-            echo "    Installing qrencode for QR codes..."
-            case "$PKG_MGR" in
-                apt)    apt install -y -qq qrencode ;;
-                dnf)    dnf install -y -q qrencode ;;
-                yum)    yum install -y -q qrencode ;;
-                pacman) pacman -S --noconfirm qrencode ;;
-            esac
-        fi
-
-        if command -v qrencode &>/dev/null; then
-            echo ""
-            echo "    ┌─────────────────────────────────────────────────────┐"
-            echo "    │  STEP 1: Install the ntfy app                       │"
-            echo "    │  Scan this QR code or visit: https://ntfy.sh        │"
-            echo "    └─────────────────────────────────────────────────────┘"
-            echo ""
-            qrencode -t ANSIUTF8 "https://ntfy.sh" | sed 's/^/    /'
-            echo ""
-            echo "    ┌─────────────────────────────────────────────────────┐"
-            echo "    │  STEP 2: Subscribe to your alerts                   │"
-            echo "    │  Scan this QR code in the ntfy app                  │"
-            echo "    └─────────────────────────────────────────────────────┘"
-            echo ""
-            qrencode -t ANSIUTF8 "$NTFY_URL" | sed 's/^/    /'
-            echo ""
-            echo "    Your topic: $NTFY_TOPIC"
-            echo "    Keep this private - anyone with the topic can subscribe."
-            echo ""
-            read -p "    Press Enter after subscribing in the ntfy app... " _
-        else
-            echo ""
-            echo "    To receive notifications:"
-            echo "    1. Install ntfy app: https://ntfy.sh"
-            echo "    2. Subscribe to topic: $NTFY_TOPIC"
-            echo ""
-        fi
-    fi
 else
     echo "    Config already exists, skipping"
 fi
@@ -238,5 +134,7 @@ echo "Next steps:"
 echo "  1. Start service: sudo systemctl enable --now disk-watchdog"
 echo "  2. Check status:  sudo disk-watchdog status"
 echo ""
-echo "Optional: Edit /etc/disk-watchdog.conf to customize thresholds"
+echo "Optional:"
+echo "  - Edit /etc/disk-watchdog.conf to customize"
+echo "  - Run 'sudo disk-watchdog setup-ntfy' for push notifications"
 echo ""

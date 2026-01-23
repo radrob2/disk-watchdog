@@ -31,20 +31,23 @@ Adaptive disk space monitor that checks more frequently as your disk fills up, a
 
 ```bash
 # One-liner install (requires root)
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/radrob2/disk-watchdog/master/install.sh)"
+curl -fsSL https://raw.githubusercontent.com/radrob2/disk-watchdog/master/install.sh | sudo bash
 ```
 
-The installer will:
-- Install eBPF tools (bpfcc-tools) automatically
-- Ask if you want to monitor all users or a specific user
-- Optionally set up push notifications to your phone (ntfy.sh) with QR codes
-- Configure and start the systemd service
+This installs with sensible defaults (monitors all users, no push notifications).
+
+**Interactive install** (for push notifications setup with QR codes):
+```bash
+curl -fsSL https://raw.githubusercontent.com/radrob2/disk-watchdog/master/install-interactive.sh -o /tmp/install.sh
+sudo bash /tmp/install.sh
+```
 
 **Manual install:**
 ```bash
 git clone https://github.com/radrob2/disk-watchdog
 cd disk-watchdog
-sudo ./install.sh
+sudo ./install.sh              # non-interactive
+sudo ./install-interactive.sh  # with prompts
 ```
 
 ## Usage
