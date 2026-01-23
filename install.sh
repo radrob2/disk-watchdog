@@ -4,6 +4,23 @@ set -euo pipefail
 
 REPO_URL="https://raw.githubusercontent.com/radrob2/disk-watchdog/master"
 
+# If stdin is not a terminal (piped), re-download and exec properly
+if [[ ! -t 0 ]]; then
+    # Download to temp file and re-exec with terminal access
+    TMPSCRIPT=$(mktemp)
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$REPO_URL/install.sh" -o "$TMPSCRIPT"
+    elif command -v wget &>/dev/null; then
+        wget -q "$REPO_URL/install.sh" -O "$TMPSCRIPT"
+    else
+        echo "Error: curl or wget required."
+        exit 1
+    fi
+    chmod +x "$TMPSCRIPT"
+    exec bash "$TMPSCRIPT" "$@"
+    # exec replaces this process, so we never reach here
+fi
+
 echo "========================================"
 echo "  disk-watchdog installer"
 echo "========================================"
@@ -115,15 +132,15 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
     echo "    1) All users (recommended) - catches any runaway process"
     echo "    2) Specific user only - only manages one user's processes"
     echo ""
-    read -p "    Choose [1/2] (default: 1): " monitor_choice </dev/tty
+    read -p "    Choose [1/2] (default: 1): " monitor_choice
 
     if [[ "$monitor_choice" == "2" ]]; then
         # Get the user who invoked sudo (not root)
         REAL_USER="${SUDO_USER:-}"
         if [[ -z "$REAL_USER" ]]; then
-            read -p "    Enter username to monitor: " REAL_USER </dev/tty
+            read -p "    Enter username to monitor: " REAL_USER
         else
-            read -p "    Enter username to monitor (default: $REAL_USER): " input_user </dev/tty
+            read -p "    Enter username to monitor (default: $REAL_USER): " input_user
             [[ -n "$input_user" ]] && REAL_USER="$input_user"
         fi
 
@@ -142,7 +159,7 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
     echo "    Do you want push notifications to your phone?"
     echo "    (Uses ntfy.sh - free, no account required)"
     echo ""
-    read -p "    Enable push notifications? [y/N]: " enable_ntfy </dev/tty
+    read -p "    Enable push notifications? [y/N]: " enable_ntfy
 
     if [[ "$enable_ntfy" =~ ^[Yy] ]]; then
         # Generate random topic name
@@ -189,7 +206,7 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
             echo "    Your topic: $NTFY_TOPIC"
             echo "    Keep this private - anyone with the topic can subscribe."
             echo ""
-            read -p "    Press Enter after subscribing in the ntfy app... " _ </dev/tty
+            read -p "    Press Enter after subscribing in the ntfy app... " _
         else
             echo ""
             echo "    To receive notifications:"
