@@ -108,6 +108,68 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
     fi
 
     echo "    Created /etc/disk-watchdog.conf"
+
+    # Ask about push notifications
+    echo ""
+    echo "    Do you want push notifications to your phone?"
+    echo "    (Uses ntfy.sh - free, no account required)"
+    echo ""
+    read -p "    Enable push notifications? [y/N]: " enable_ntfy
+
+    if [[ "$enable_ntfy" =~ ^[Yy] ]]; then
+        # Generate random topic name
+        NTFY_TOPIC="disk-watchdog-$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 8)"
+        NTFY_URL="https://ntfy.sh/${NTFY_TOPIC}"
+
+        # Update config
+        sed -i "s|^DISK_WATCHDOG_WEBHOOK=.*|DISK_WATCHDOG_WEBHOOK=true|" /etc/disk-watchdog.conf
+        sed -i "s|^# DISK_WATCHDOG_WEBHOOK_URL=.*|DISK_WATCHDOG_WEBHOOK_URL=${NTFY_URL}|" /etc/disk-watchdog.conf
+
+        echo ""
+        echo "    Push notifications enabled!"
+        echo "    Topic: $NTFY_TOPIC"
+        echo "    URL: $NTFY_URL"
+        echo ""
+
+        # Check for qrencode
+        if ! command -v qrencode &>/dev/null; then
+            echo "    Installing qrencode for QR codes..."
+            case "$PKG_MGR" in
+                apt)    apt install -y -qq qrencode ;;
+                dnf)    dnf install -y -q qrencode ;;
+                yum)    yum install -y -q qrencode ;;
+                pacman) pacman -S --noconfirm qrencode ;;
+            esac
+        fi
+
+        if command -v qrencode &>/dev/null; then
+            echo ""
+            echo "    ┌─────────────────────────────────────────────────────┐"
+            echo "    │  STEP 1: Install the ntfy app                       │"
+            echo "    │  Scan this QR code or visit: https://ntfy.sh        │"
+            echo "    └─────────────────────────────────────────────────────┘"
+            echo ""
+            qrencode -t ANSIUTF8 "https://ntfy.sh" | sed 's/^/    /'
+            echo ""
+            echo "    ┌─────────────────────────────────────────────────────┐"
+            echo "    │  STEP 2: Subscribe to your alerts                   │"
+            echo "    │  Scan this QR code in the ntfy app                  │"
+            echo "    └─────────────────────────────────────────────────────┘"
+            echo ""
+            qrencode -t ANSIUTF8 "$NTFY_URL" | sed 's/^/    /'
+            echo ""
+            echo "    Your topic: $NTFY_TOPIC"
+            echo "    Keep this private - anyone with the topic can subscribe."
+            echo ""
+            read -p "    Press Enter after subscribing in the ntfy app... " _
+        else
+            echo ""
+            echo "    To receive notifications:"
+            echo "    1. Install ntfy app: https://ntfy.sh"
+            echo "    2. Subscribe to topic: $NTFY_TOPIC"
+            echo ""
+        fi
+    fi
 else
     echo "    Config already exists, skipping"
 fi
