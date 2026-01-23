@@ -1,0 +1,21 @@
+[Unit]
+Description=Adaptive Disk Space Watchdog
+Documentation=https://github.com/radrob/disk-watchdog
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/disk-watchdog
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+
+# Hardening
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/log /tmp /run
+NoNewPrivileges=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
