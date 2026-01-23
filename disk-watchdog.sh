@@ -1162,7 +1162,7 @@ OPTIONS:
 
 QUICK START:
     # One-liner install
-    curl -fsSL https://raw.githubusercontent.com/.../install.sh | sudo bash
+    sudo bash -c "\$(curl -fsSL https://raw.githubusercontent.com/radrob2/disk-watchdog/master/install.sh)"
 
     # Or manual
     sudo cp disk-watchdog.sh /usr/local/bin/disk-watchdog
