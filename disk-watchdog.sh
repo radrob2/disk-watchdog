@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly SCRIPT_NAME="disk-watchdog"
 
 # =============================================================================
@@ -561,7 +561,7 @@ cleanup_tracked_writers() {
 # =============================================================================
 
 # Record a paused process for auto-resume tracking
-# Format: pid:comm:pause_time:strikes
+# Format: pid<TAB>comm<TAB>pause_time<TAB>strikes (TAB delimiter handles colons in names)
 record_paused_pid() {
     local pid="$1"
     local comm="$2"
@@ -574,21 +574,21 @@ record_paused_pid() {
     local strikes=1
     if [[ -f "$PAUSED_PIDS_FILE" ]]; then
         local old_entry
-        old_entry=$(grep "^${pid}:${comm}:" "$PAUSED_PIDS_FILE" 2>/dev/null | tail -1)
+        old_entry=$(grep "^${pid}	${comm}	" "$PAUSED_PIDS_FILE" 2>/dev/null | tail -1)
         if [[ -n "$old_entry" ]]; then
             local old_time old_strikes
-            old_time=$(echo "$old_entry" | cut -d: -f3)
-            old_strikes=$(echo "$old_entry" | cut -d: -f4)
+            old_time=$(echo "$old_entry" | cut -f3)
+            old_strikes=$(echo "$old_entry" | cut -f4)
             # If paused within last hour, increment strikes
             if (( now - old_time < 3600 )); then
                 strikes=$(( old_strikes + 1 ))
             fi
             # Remove old entry
-            sed -i "/^${pid}:${comm}:/d" "$PAUSED_PIDS_FILE" 2>/dev/null || true
+            sed -i "/^${pid}	${comm}	/d" "$PAUSED_PIDS_FILE" 2>/dev/null || true
         fi
     fi
 
-    echo "${pid}:${comm}:${now}:${strikes}" >> "$PAUSED_PIDS_FILE" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\n' "$pid" "$comm" "$now" "$strikes" >> "$PAUSED_PIDS_FILE" 2>/dev/null || true
 
     if (( strikes >= RESUME_MAX_STRIKES )); then
         log_msg "WARN" "Process $comm (PID $pid) paused $strikes times in an hour - will NOT auto-resume"
@@ -619,7 +619,7 @@ check_auto_resume() {
     local resumed_names=()
     > "$temp_file"
 
-    while IFS=: read -r pid comm pause_time strikes; do
+    while IFS=$'\t' read -r pid comm pause_time strikes; do
         [[ -z "$pid" ]] && continue
 
         # Check if process still exists
@@ -645,7 +645,7 @@ check_auto_resume() {
         # Check strike limit
         if (( strikes >= RESUME_MAX_STRIKES )); then
             log_msg "DEBUG" "Process $comm (PID $pid) has $strikes strikes, keeping paused"
-            echo "${pid}:${comm}:${pause_time}:${strikes}" >> "$temp_file"
+            printf '%s\t%s\t%s\t%s\n' "$pid" "$comm" "$pause_time" "$strikes" >> "$temp_file"
             continue
         fi
 
@@ -654,7 +654,7 @@ check_auto_resume() {
         if (( paused_seconds < RESUME_COOLDOWN )); then
             local remaining=$(( RESUME_COOLDOWN - paused_seconds ))
             log_msg "DEBUG" "Process $comm (PID $pid) in cooldown, ${remaining}s remaining"
-            echo "${pid}:${comm}:${pause_time}:${strikes}" >> "$temp_file"
+            printf '%s\t%s\t%s\t%s\n' "$pid" "$comm" "$pause_time" "$strikes" >> "$temp_file"
             continue
         fi
 
@@ -692,7 +692,7 @@ cleanup_paused_pids() {
     now=$(date +%s)
     > "$temp_file"
 
-    while IFS=: read -r pid comm pause_time strikes; do
+    while IFS=$'\t' read -r pid comm pause_time strikes; do
         [[ -z "$pid" ]] && continue
 
         # Remove entries for dead processes
@@ -706,7 +706,7 @@ cleanup_paused_pids() {
         current_comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
         [[ "$current_comm" != "$comm" ]] && continue
 
-        echo "${pid}:${comm}:${pause_time}:${strikes}" >> "$temp_file"
+        printf '%s\t%s\t%s\t%s\n' "$pid" "$comm" "$pause_time" "$strikes" >> "$temp_file"
     done < "$PAUSED_PIDS_FILE" 2>/dev/null
 
     mv "$temp_file" "$PAUSED_PIDS_FILE" 2>/dev/null || true
@@ -1124,7 +1124,7 @@ cmd_status() {
         if [[ -f "$PAUSED_PIDS_FILE" ]] && [[ -s "$PAUSED_PIDS_FILE" ]]; then
             echo ""
             echo "Currently paused processes:"
-            while IFS=: read -r pid comm pause_time strikes; do
+            while IFS=$'\t' read -r pid comm pause_time strikes; do
                 [[ -z "$pid" ]] && continue
                 [[ ! -d "/proc/$pid" ]] && continue
                 local paused_ago=$(( $(date +%s) - pause_time ))
@@ -1456,7 +1456,7 @@ cmd_resume() {
     echo "Resuming all paused processes..."
     local resumed=0
 
-    while IFS=: read -r pid comm pause_time strikes; do
+    while IFS=$'\t' read -r pid comm pause_time strikes; do
         [[ -z "$pid" ]] && continue
         [[ ! -d "/proc/$pid" ]] && continue
 
