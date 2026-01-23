@@ -10,10 +10,13 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=10
 
+# Systemd watchdog: if script doesn't respond in 60s, restart it
+WatchdogSec=60
+
 # Hardening
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/log /tmp /run
+ReadWritePaths=/var/log /tmp /run /var/lib/disk-watchdog
 NoNewPrivileges=false
 PrivateTmp=true
 
