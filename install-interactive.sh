@@ -18,7 +18,7 @@ if [[ ! -t 0 ]]; then
         exit 1
     fi
     chmod +x "$TMPSCRIPT"
-    exec bash "$TMPSCRIPT" "$@"
+    exec bash "$TMPSCRIPT" "$@" </dev/tty
 fi
 
 echo "========================================"
