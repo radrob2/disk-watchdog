@@ -2,7 +2,7 @@
 # disk-watchdog installer
 set -euo pipefail
 
-REPO_URL="https://raw.githubusercontent.com/radrob/disk-watchdog/master"
+REPO_URL="https://raw.githubusercontent.com/radrob2/disk-watchdog/master"
 
 echo "========================================"
 echo "  disk-watchdog installer"

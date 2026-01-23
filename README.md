@@ -31,7 +31,7 @@ Adaptive disk space monitor that checks more frequently as your disk fills up, a
 
 ```bash
 # One-liner install (requires root)
-curl -fsSL https://raw.githubusercontent.com/radrob/disk-watchdog/master/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/radrob2/disk-watchdog/master/install.sh | sudo bash
 ```
 
 The installer will:
@@ -42,7 +42,7 @@ The installer will:
 
 **Manual install:**
 ```bash
-git clone https://github.com/radrob/disk-watchdog
+git clone https://github.com/radrob2/disk-watchdog
 cd disk-watchdog
 sudo ./install.sh
 ```
@@ -227,4 +227,4 @@ MIT
 
 ## Contributing
 
-Issues and PRs welcome at https://github.com/radrob/disk-watchdog
+Issues and PRs welcome at https://github.com/radrob2/disk-watchdog
