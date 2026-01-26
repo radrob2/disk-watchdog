@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-readonly VERSION="1.2.1"
+readonly VERSION="1.2.5"
 readonly SCRIPT_NAME="disk-watchdog"
 
 # =============================================================================
@@ -953,18 +953,29 @@ get_heavy_writers() {
 
 format_bytes() {
     local bytes="$1"
-    local result
-    # Force C locale for consistent decimal point
-    if (( bytes >= 1073741824 )); then
-        result=$(LC_ALL=C awk "BEGIN {printf \"%.1f\", $bytes/1073741824}")
-        echo "${result}GB"
-    elif (( bytes >= 1048576 )); then
-        result=$(LC_ALL=C awk "BEGIN {printf \"%.1f\", $bytes/1048576}")
-        echo "${result}MB"
-    else
-        result=$(LC_ALL=C awk "BEGIN {printf \"%.1f\", $bytes/1024}")
-        echo "${result}KB"
-    fi
+    # Smart formatting: 2-3 significant digits, space before unit (SI standard)
+    # >= 10: no decimals (e.g., 78 GB, 12 MB)
+    # < 10: 1 decimal (e.g., 1.4 GB, 8.3 MB)
+    LC_ALL=C awk -v bytes="$bytes" 'BEGIN {
+        if (bytes >= 1099511627776) {
+            val = bytes / 1099511627776; unit = "TB"
+        } else if (bytes >= 1073741824) {
+            val = bytes / 1073741824; unit = "GB"
+        } else if (bytes >= 1048576) {
+            val = bytes / 1048576; unit = "MB"
+        } else {
+            val = bytes / 1024; unit = "KB"
+        }
+
+        if (val >= 10) printf "%.0f %s", val, unit
+        else printf "%.1f %s", val, unit
+    }'
+}
+
+# Format bytes per second as a rate
+format_rate() {
+    local bytes_per_sec="$1"
+    echo "$(format_bytes "$bytes_per_sec")/s"
 }
 
 # =============================================================================
@@ -1110,25 +1121,42 @@ action_harsh_warn() {
     if can_notify "harsh"; then
         log_msg "WARNING" "${free}GB free"
 
-        local writers_info=""
+        local rate_info=""
+        (( rate > 0 )) && rate_info="Filling at ~${rate}GB/min!\n"
+
+        # Get top writers with CURRENT write rates (not cumulative totals)
+        local desktop_writers=""
+        local short_writer=""
         if [[ "$SMART_MODE" == "true" ]]; then
-            local top_writer
-            top_writer=$(get_heavy_writers | head -1)
-            if [[ -n "$top_writer" ]]; then
-                local bytes comm
-                IFS=: read -r bytes _ comm <<< "$top_writer"
-                writers_info=" Top writer: $comm ($(format_bytes "$bytes"))"
-            fi
+            local count=0
+            # Use get_write_rates for current rates (more meaningful than cumulative totals)
+            while IFS=: read -r bytes_per_sec pid comm; do
+                [[ -z "$pid" ]] && continue
+                local formatted=$(format_rate "$bytes_per_sec")
+                if (( count == 0 )); then
+                    short_writer="Top: $comm @ $formatted"
+                fi
+                desktop_writers+="• $comm (PID $pid) @ $formatted\n"
+                (( ++count >= 3 )) && break
+            done < <(get_write_rates 1)
         fi
 
-        local rate_info=""
-        (( rate > 0 )) && rate_info=" Filling at ~${rate}GB/min!"
+        # Detailed message for desktop
+        local desktop_msg="${free}GB free on $MOUNT_POINT\n${rate_info}"
+        if [[ -n "$desktop_writers" ]]; then
+            desktop_msg+="Active writers:\n${desktop_writers}"
+        else
+            desktop_msg+="(no heavy writers detected)\n"
+        fi
+        desktop_msg+="Run: disk-watchdog status"
 
-        local msg="${free}GB free.${rate_info}${writers_info}"
-        notify_desktop "critical" "Disk Space Low" "$msg"
-        notify_wall "DISK WARNING: $msg"
-        notify_email "[WARNING] Disk Space Getting Low" "disk-watchdog warning on $(hostname):\n\n$msg\n\nMount: $MOUNT_POINT\nTime: $(date)\n\nNo action taken yet - this is an early warning."
-        notify_webhook "Disk Space Low" "$msg"
+        # Short message for phone/webhook
+        local short_msg="${free}GB free. ${rate_info}${short_writer}"
+
+        notify_desktop "critical" "Disk Space Low" "$desktop_msg"
+        notify_wall "DISK WARNING: ${free}GB free.${rate_info:+ $rate_info}${short_writer:+ $short_writer}"
+        notify_email "[WARNING] Disk Space Getting Low" "disk-watchdog warning on $(hostname):\n\n${free}GB free\n${rate_info}\n${desktop_writers}\nMount: $MOUNT_POINT\nTime: $(date)\n\nNo action taken yet - this is an early warning."
+        notify_webhook "Disk Space Low" "$short_msg"
     fi
 }
 
@@ -1311,9 +1339,27 @@ cmd_test() {
 
     if [[ "$test_level" == "all" || "$test_level" == "harsh" ]]; then
         echo "Testing HARSH level..."
-        notify_desktop "critical" "TEST: Disk Space Low" "This is a test notification (harsh level)"
+        # Build a realistic notification showing current writers
+        local test_writers=""
+        local count=0
+        while IFS=: read -r bytes_per_sec pid comm; do
+            [[ -z "$pid" ]] && continue
+            local formatted=$(format_rate "$bytes_per_sec")
+            test_writers+="• $comm (PID $pid) @ $formatted\n"
+            (( ++count >= 3 )) && break
+        done < <(get_write_rates 1)
+
+        local test_msg="${free}GB free on $MOUNT_POINT\n"
+        if [[ -n "$test_writers" ]]; then
+            test_msg+="Active writers:\n${test_writers}"
+        else
+            test_msg+="(no heavy writers detected)\n"
+        fi
+        test_msg+="Run: disk-watchdog status"
+
+        notify_desktop "critical" "TEST: Disk Space Low" "$test_msg"
         if [[ "$ENABLE_WALL" == "true" ]]; then
-            notify_wall "TEST: disk-watchdog harsh warning test"
+            notify_wall "TEST: disk-watchdog harsh warning - ${free}GB free"
             echo "  Wall message sent"
         fi
         echo "  Desktop notification sent"
