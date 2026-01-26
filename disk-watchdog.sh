@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.2.1"
 readonly SCRIPT_NAME="disk-watchdog"
 
 # =============================================================================
@@ -504,6 +504,9 @@ track_writer() {
     timestamp=$(date +%s)
 
     # Format: pid<TAB>comm<TAB>bytes<TAB>first_seen<TAB>last_seen
+    # Skip tracking if not running as root (state dir not accessible)
+    [[ $EUID -ne 0 ]] && return
+
     # Update if exists, add if new
     if [[ -f "$WRITERS_FILE" ]] && grep -q "^${pid}	" "$WRITERS_FILE" 2>/dev/null; then
         # Update existing entry (preserve first_seen, update bytes and last_seen)
@@ -515,6 +518,7 @@ track_writer() {
 
 # Get known heavy writers that are still running
 get_tracked_writers() {
+    [[ $EUID -ne 0 ]] && return  # Skip if not root
     [[ ! -f "$WRITERS_FILE" ]] && return
 
     while IFS=$'\t' read -r pid comm bytes first_seen last_seen; do
