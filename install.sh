@@ -367,12 +367,31 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
                 sed -i "s|^DISK_WATCHDOG_EMAIL=.*|DISK_WATCHDOG_EMAIL=true|" /etc/disk-watchdog.conf
                 sed -i "s|^# DISK_WATCHDOG_EMAIL_TO=.*|DISK_WATCHDOG_EMAIL_TO=$email_addr|" /etc/disk-watchdog.conf
 
-                # Check if mail command exists
+                # Check if mail command exists, offer to install if not
                 if command -v mail &>/dev/null || command -v sendmail &>/dev/null || command -v msmtp &>/dev/null; then
                     success "Email notifications enabled → $email_addr"
                 else
-                    success "Email configured → $email_addr"
-                    echo -e "  ${YELLOW}⚠${NC}  ${DIM}No mail command found. Install mailutils, sendmail, or msmtp.${NC}"
+                    echo ""
+                    echo -e "  ${YELLOW}⚠${NC}  No mail command found."
+                    read -p "  Install mailutils now? [Y/n]: " install_mail
+                    if [[ ! "$install_mail" =~ ^[Nn] ]]; then
+                        step "Installing mailutils..."
+                        case "$PKG_MGR" in
+                            apt)    apt install -y -qq mailutils >/dev/null 2>&1 ;;
+                            dnf)    dnf install -y -q mailx >/dev/null 2>&1 ;;
+                            yum)    yum install -y -q mailx >/dev/null 2>&1 ;;
+                            pacman) pacman -S --noconfirm mailutils >/dev/null 2>&1 ;;
+                        esac
+                        if command -v mail &>/dev/null; then
+                            success "Installed mailutils"
+                            success "Email notifications enabled → $email_addr"
+                        else
+                            error "Installation failed. Configure mail manually."
+                        fi
+                    else
+                        success "Email configured → $email_addr"
+                        info "Install mailutils/sendmail/msmtp later to send emails"
+                    fi
                 fi
                 [[ "$CONFIG_NOTIFY" == "none" ]] && CONFIG_NOTIFY="email" || CONFIG_NOTIFY+=", email"
             else
