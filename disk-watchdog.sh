@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-readonly VERSION="1.3.1"
+readonly VERSION="1.3.2"
 readonly SCRIPT_NAME="disk-watchdog"
 
 # =============================================================================
@@ -83,8 +83,8 @@ ACTION_WRITE_RATE_THRESHOLD="${DISK_WATCHDOG_ACTION_RATE:-1048576}"
 
 # Assumed maximum write speed (GB/s) for calculating safe check intervals
 # Used to ensure we check frequently enough on small disks with fast storage
-# Default: 7 GB/s (7000 MB/s) - covers fastest PCIe 4.0/5.0 NVMe SSDs
-ASSUMED_MAX_WRITE_SPEED="${DISK_WATCHDOG_MAX_WRITE_SPEED:-7}"
+# Default: 10 GB/s - covers fastest PCIe 5.0 NVMe and future drives
+ASSUMED_MAX_WRITE_SPEED="${DISK_WATCHDOG_MAX_WRITE_SPEED:-10}"
 
 # Fallback process patterns if smart mode fails
 PROC_PATTERNS="${DISK_WATCHDOG_PROCS:-fastp|kraken|dustmasker|bwa|spades|megahit|rsync|photorec|dd|cp|mv}"
@@ -450,42 +450,48 @@ get_check_interval() {
     # Dynamic intervals based on buffer to next threshold
     # Ensures we check frequently enough even on small disks with fast storage
     # Formula: interval = buffer / max_write_speed / safety_factor
-    # With min/max bounds per level to avoid too slow or too frequent checks
+    #
+    # Min/max bounds per level:
+    # - Minimums ensure we don't waste CPU checking too often
+    # - Maximums ensure we don't miss rapid filling
+    # - At 10 GB/s, action takes ~1-2s, so min 1s at critical levels
+    #
+    # Safety factor of 2 means we get at least 2 checks before hitting next threshold
 
-    local buffer next_thresh min_interval max_interval safe_interval
+    local buffer min_interval max_interval safe_interval
 
     if (( free > THRESH_NOTICE )); then
-        # OK level - no immediate concern
+        # OK level - no urgency, but stay aware
         buffer=$(( free - THRESH_NOTICE ))
-        min_interval=60    # At least 1 min
-        max_interval=300   # At most 5 min
-    elif (( free > THRESH_WARN )); then
-        # Notice level
-        buffer=$(( free - THRESH_WARN ))
         min_interval=30
+        max_interval=300
+    elif (( free > THRESH_WARN )); then
+        # Notice level - paying attention
+        buffer=$(( free - THRESH_WARN ))
+        min_interval=15
         max_interval=60
     elif (( free > THRESH_HARSH )); then
-        # Warn level
+        # Warn level - need to catch trends
         buffer=$(( free - THRESH_HARSH ))
-        min_interval=10
+        min_interval=5
         max_interval=30
     elif (( free > THRESH_PAUSE )); then
-        # Harsh level - getting serious
+        # Harsh level - close to action zone
         buffer=$(( free - THRESH_PAUSE ))
-        min_interval=3
+        min_interval=2
         max_interval=10
     elif (( free > THRESH_STOP )); then
-        # Pause level - critical
+        # Pause level - critical, buffer could be ~15GB = 1.5s at 10GB/s
         buffer=$(( free - THRESH_STOP ))
         min_interval=1
         max_interval=3
     elif (( free > THRESH_KILL )); then
-        # Stop level - emergency
+        # Stop level - emergency, minimal buffer
         buffer=$(( free - THRESH_KILL ))
         min_interval=1
-        max_interval=1
+        max_interval=2
     else
-        # Kill level - extreme emergency
+        # Kill level - extreme emergency, check constantly
         echo 1
         return
     fi
