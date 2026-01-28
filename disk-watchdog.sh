@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-readonly VERSION="1.2.5"
+readonly VERSION="1.2.6"
 readonly SCRIPT_NAME="disk-watchdog"
 
 # =============================================================================
@@ -434,6 +434,7 @@ get_check_interval() {
 get_level() {
     local free="$1"
     local rate="${2:-0}"  # Optional: GB/min fill rate
+    local interval="${3:-0}"  # Optional: current check interval in seconds
 
     # Base level from free space
     local level
@@ -446,35 +447,36 @@ get_level() {
     else                                  level="ok"
     fi
 
-    # Rate-aware escalation: if we'll hit next threshold in < RATE_ESCALATE_MINUTES, escalate now
-    if (( rate > 0 && RATE_ESCALATE_MINUTES > 0 )); then
-        local minutes_to_next=999
+    # Rate-aware escalation: only escalate if we'll hit the next threshold before the next check
+    # This prevents unnecessary pauses when disk is filling fast but we have plenty of buffer
+    if (( rate > 0 && interval > 0 )); then
+        local seconds_to_next=999999
 
         case "$level" in
             ok)
-                # Minutes until notice threshold
-                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_NOTICE) / rate ))
-                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="notice"
+                # Seconds until notice threshold
+                seconds_to_next=$(( (free - THRESH_NOTICE) * 60 / rate ))
+                (( seconds_to_next < interval )) && level="notice"
                 ;;
             notice)
-                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_WARN) / rate ))
-                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="warn"
+                seconds_to_next=$(( (free - THRESH_WARN) * 60 / rate ))
+                (( seconds_to_next < interval )) && level="warn"
                 ;;
             warn)
-                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_HARSH) / rate ))
-                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="harsh"
+                seconds_to_next=$(( (free - THRESH_HARSH) * 60 / rate ))
+                (( seconds_to_next < interval )) && level="harsh"
                 ;;
             harsh)
-                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_PAUSE) / rate ))
-                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="pause"
+                seconds_to_next=$(( (free - THRESH_PAUSE) * 60 / rate ))
+                (( seconds_to_next < interval )) && level="pause"
                 ;;
             pause)
-                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_STOP) / rate ))
-                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="stop"
+                seconds_to_next=$(( (free - THRESH_STOP) * 60 / rate ))
+                (( seconds_to_next < interval )) && level="stop"
                 ;;
             stop)
-                (( rate > 0 )) && minutes_to_next=$(( (free - THRESH_KILL) / rate ))
-                (( minutes_to_next < RATE_ESCALATE_MINUTES )) && level="kill"
+                seconds_to_next=$(( (free - THRESH_KILL) * 60 / rate ))
+                (( seconds_to_next < interval )) && level="kill"
                 ;;
         esac
     fi
@@ -561,12 +563,13 @@ cleanup_tracked_writers() {
 # =============================================================================
 
 # Record a paused process for auto-resume tracking
-# Format: pid<TAB>comm<TAB>pause_time<TAB>strikes (TAB delimiter handles colons in names)
+# Format: pid<TAB>comm<TAB>pause_time<TAB>strikes<TAB>free_at_pause (TAB delimiter handles colons in names)
 record_paused_pid() {
     local pid="$1"
     local comm="$2"
-    local now
+    local now free_at_pause
     now=$(date +%s)
+    free_at_pause=$(get_free_gb)
 
     [[ "$AUTO_RESUME" != "true" ]] && return
 
@@ -588,7 +591,7 @@ record_paused_pid() {
         fi
     fi
 
-    printf '%s\t%s\t%s\t%s\n' "$pid" "$comm" "$now" "$strikes" >> "$PAUSED_PIDS_FILE" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$comm" "$now" "$strikes" "$free_at_pause" >> "$PAUSED_PIDS_FILE" 2>/dev/null || true
 
     if (( strikes >= RESUME_MAX_STRIKES )); then
         log_msg "WARN" "Process $comm (PID $pid) paused $strikes times in an hour - will NOT auto-resume"
@@ -617,10 +620,13 @@ check_auto_resume() {
 
     local temp_file="${PAUSED_PIDS_FILE}.tmp"
     local resumed_names=()
+    local min_free_at_pause=999999  # Track lowest free space at pause for messaging
     > "$temp_file"
 
-    while IFS=$'\t' read -r pid comm pause_time strikes; do
+    while IFS=$'\t' read -r pid comm pause_time strikes free_at_pause; do
         [[ -z "$pid" ]] && continue
+        # Handle old format (4 fields) by defaulting free_at_pause
+        [[ -z "$free_at_pause" ]] && free_at_pause=0
 
         # Check if process still exists
         if [[ ! -d "/proc/$pid" ]]; then
@@ -645,7 +651,7 @@ check_auto_resume() {
         # Check strike limit
         if (( strikes >= RESUME_MAX_STRIKES )); then
             log_msg "DEBUG" "Process $comm (PID $pid) has $strikes strikes, keeping paused"
-            printf '%s\t%s\t%s\t%s\n' "$pid" "$comm" "$pause_time" "$strikes" >> "$temp_file"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$comm" "$pause_time" "$strikes" "$free_at_pause" >> "$temp_file"
             continue
         fi
 
@@ -654,17 +660,20 @@ check_auto_resume() {
         if (( paused_seconds < RESUME_COOLDOWN )); then
             local remaining=$(( RESUME_COOLDOWN - paused_seconds ))
             log_msg "DEBUG" "Process $comm (PID $pid) in cooldown, ${remaining}s remaining"
-            printf '%s\t%s\t%s\t%s\n' "$pid" "$comm" "$pause_time" "$strikes" >> "$temp_file"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$comm" "$pause_time" "$strikes" "$free_at_pause" >> "$temp_file"
             continue
         fi
 
+        # Track the lowest free_at_pause for accurate messaging
+        (( free_at_pause > 0 && free_at_pause < min_free_at_pause )) && min_free_at_pause=$free_at_pause
+
         # All checks passed - resume the process
         if [[ "$DRY_RUN" == "true" ]]; then
-            log_msg "DRY-RUN" "Would resume $comm (PID $pid) - disk space recovered to ${free}GB"
+            log_msg "DRY-RUN" "Would resume $comm (PID $pid) - ${free}GB free"
             resumed_names+=("$comm")
         else
             if kill -CONT "$pid" 2>/dev/null; then
-                log_msg "RESUME" "Auto-resumed $comm (PID $pid) - disk space recovered to ${free}GB"
+                log_msg "RESUME" "Auto-resumed $comm (PID $pid) - ${free}GB free"
                 resumed_names+=("$comm")
             else
                 log_msg "WARN" "Failed to resume $comm (PID $pid)"
@@ -677,7 +686,12 @@ check_auto_resume() {
 
     # Notify if we resumed anything
     if (( ${#resumed_names[@]} > 0 )); then
-        local msg="Disk recovered to ${free}GB. Resumed: ${resumed_names[*]}"
+        local msg
+        if (( free > min_free_at_pause && min_free_at_pause < 999999 )); then
+            msg="Disk recovered to ${free}GB (was ${min_free_at_pause}GB). Resumed: ${resumed_names[*]}"
+        else
+            msg="Disk stable at ${free}GB. Resumed: ${resumed_names[*]}"
+        fi
         notify_desktop "normal" "Processes Resumed" "$msg"
         notify_webhook "Processes Resumed" "$msg"
     fi
@@ -692,8 +706,10 @@ cleanup_paused_pids() {
     now=$(date +%s)
     > "$temp_file"
 
-    while IFS=$'\t' read -r pid comm pause_time strikes; do
+    while IFS=$'\t' read -r pid comm pause_time strikes free_at_pause; do
         [[ -z "$pid" ]] && continue
+        # Handle old format (4 fields) by defaulting free_at_pause
+        [[ -z "$free_at_pause" ]] && free_at_pause=0
 
         # Remove entries for dead processes
         [[ ! -d "/proc/$pid" ]] && continue
@@ -706,7 +722,7 @@ cleanup_paused_pids() {
         current_comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
         [[ "$current_comm" != "$comm" ]] && continue
 
-        printf '%s\t%s\t%s\t%s\n' "$pid" "$comm" "$pause_time" "$strikes" >> "$temp_file"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$comm" "$pause_time" "$strikes" "$free_at_pause" >> "$temp_file"
     done < "$PAUSED_PIDS_FILE" 2>/dev/null
 
     mv "$temp_file" "$PAUSED_PIDS_FILE" 2>/dev/null || true
@@ -1231,13 +1247,15 @@ cmd_status() {
         if [[ -f "$PAUSED_PIDS_FILE" ]] && [[ -s "$PAUSED_PIDS_FILE" ]]; then
             echo ""
             echo "Currently paused processes:"
-            while IFS=$'\t' read -r pid comm pause_time strikes; do
+            while IFS=$'\t' read -r pid comm pause_time strikes free_at_pause; do
                 [[ -z "$pid" ]] && continue
                 [[ ! -d "/proc/$pid" ]] && continue
                 local paused_ago=$(( $(date +%s) - pause_time ))
                 local mins=$(( paused_ago / 60 ))
                 local secs=$(( paused_ago % 60 ))
-                printf "  PID %s (%s) - paused %dm%ds ago, %d strike(s)\n" "$pid" "$comm" "$mins" "$secs" "$strikes"
+                local free_info=""
+                [[ -n "$free_at_pause" && "$free_at_pause" != "0" ]] && free_info=" (was ${free_at_pause}GB free)"
+                printf "  PID %s (%s) - paused %dm%ds ago, %d strike(s)%s\n" "$pid" "$comm" "$mins" "$secs" "$strikes" "$free_info"
             done < "$PAUSED_PIDS_FILE"
         fi
     fi
@@ -1468,8 +1486,8 @@ cmd_run() {
         rate=$(calculate_rate "$free_bytes")
 
         local level interval
-        level=$(get_level "$free" "$rate")  # Pass rate for rate-aware escalation
         interval=$(get_check_interval "$free")
+        level=$(get_level "$free" "$rate" "$interval")  # Pass rate and interval for rate-aware escalation
 
         # Periodically clean up tracked writers and paused pids (every 60s, not every loop)
         local now
