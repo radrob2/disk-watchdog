@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-readonly VERSION="1.2.6"
+readonly VERSION="1.3.0"
 readonly SCRIPT_NAME="disk-watchdog"
 
 # =============================================================================
@@ -75,6 +75,11 @@ BIOTOP_CMD="${DISK_WATCHDOG_BIOTOP_CMD:-biotop-bpfcc}"
 # Minimum bytes written to consider a process a "heavy writer" (default 100MB for /proc, 1MB for biotop)
 HEAVY_WRITER_THRESHOLD="${DISK_WATCHDOG_HEAVY_THRESHOLD:-104857600}"
 BIOTOP_THRESHOLD_KB="${DISK_WATCHDOG_BIOTOP_THRESHOLD:-1024}"
+
+# Minimum write rate (bytes/sec) to target a process for pause/stop/kill
+# Default: 1MB/s - any process writing faster than this is considered problematic
+# All processes above this rate are targeted, not just "top N"
+ACTION_WRITE_RATE_THRESHOLD="${DISK_WATCHDOG_ACTION_RATE:-1048576}"
 
 # Fallback process patterns if smart mode fails
 PROC_PATTERNS="${DISK_WATCHDOG_PROCS:-fastp|kraken|dustmasker|bwa|spades|megahit|rsync|photorec|dd|cp|mv}"
@@ -215,13 +220,10 @@ calculate_thresholds() {
         (( THRESH_KILL < 1 )) && THRESH_KILL=1  # minimum 1GB
     fi
 
-    # Resume threshold: must be well above pause threshold to prevent cycling
-    # Default: THRESH_HARSH (4%) or 50GB, whichever is smaller
+    # Resume threshold: set to THRESH_HARSH (the level above pause)
+    # This ensures we don't resume until we're back in "harsh" territory, not "pause"
     if [[ "$RESUME_THRESH" == "auto" ]]; then
         RESUME_THRESH=$THRESH_HARSH
-        (( RESUME_THRESH > 50 )) && RESUME_THRESH=50
-        # Ensure it's at least 2x the pause threshold
-        (( RESUME_THRESH < THRESH_PAUSE * 2 )) && RESUME_THRESH=$(( THRESH_PAUSE * 2 ))
     fi
 }
 
@@ -411,6 +413,26 @@ get_free_gb() {
         return 1
     fi
     echo $(( free_kb / 1024 / 1024 ))
+}
+
+get_free_pct() {
+    local stats
+    stats=$(df -k "$MOUNT_POINT" 2>/dev/null | awk 'NR==2 {print $2, $4}')
+    local total_kb free_kb
+    read -r total_kb free_kb <<< "$stats"
+    if [[ -z "$total_kb" || "$total_kb" == "0" ]]; then
+        echo "0"
+        return 1
+    fi
+    echo $(( free_kb * 100 / total_kb ))
+}
+
+# Format free space with both GB and percentage
+format_free_space() {
+    local free_gb="$1"
+    local free_pct
+    free_pct=$(get_free_pct)
+    echo "${free_gb}GB (${free_pct}%)"
 }
 
 get_free_bytes() {
@@ -686,11 +708,12 @@ check_auto_resume() {
 
     # Notify if we resumed anything
     if (( ${#resumed_names[@]} > 0 )); then
-        local msg
+        local free_fmt msg
+        free_fmt=$(format_free_space "$free")
         if (( free > min_free_at_pause && min_free_at_pause < 999999 )); then
-            msg="Disk recovered to ${free}GB (was ${min_free_at_pause}GB). Resumed: ${resumed_names[*]}"
+            msg="Disk recovered to ${free_fmt} (was ${min_free_at_pause}GB). Resumed: ${resumed_names[*]}"
         else
-            msg="Disk stable at ${free}GB. Resumed: ${resumed_names[*]}"
+            msg="Disk stable at ${free_fmt}. Resumed: ${resumed_names[*]}"
         fi
         notify_desktop "normal" "Processes Resumed" "$msg"
         notify_webhook "Processes Resumed" "$msg"
@@ -1000,36 +1023,64 @@ format_rate() {
 
 kill_heavy_writers() {
     local signal="$1"
-    local max_count="${2:-5}"
-    local track_for_resume="${3:-false}"  # If true, record PIDs for auto-resume
+    local track_for_resume="${2:-false}"  # If true, record PIDs for auto-resume
     local killed=0
     local killed_names=()
 
     if [[ "$SMART_MODE" == "true" ]]; then
-        # Smart mode: detect and kill actual heavy writers
-        while IFS=: read -r bytes pid comm; do
+        # Smart mode: target ALL processes writing above ACTION_WRITE_RATE_THRESHOLD
+        # Uses real-time write rates (not cumulative totals) to catch all active writers
+        # including many parallel subprocesses from the same parent
+        while IFS=: read -r rate_bytes_sec pid comm; do
             [[ -z "$pid" ]] && continue
 
-            local bytes_fmt
-            bytes_fmt=$(format_bytes "$bytes")
+            # Skip if below threshold
+            (( rate_bytes_sec < ACTION_WRITE_RATE_THRESHOLD )) && continue
+
+            local rate_fmt
+            rate_fmt=$(format_rate "$rate_bytes_sec")
 
             if [[ "$DRY_RUN" == "true" ]]; then
-                log_msg "DRY-RUN" "Would send $signal to $comm (PID $pid, wrote $bytes_fmt)"
-                killed_names+=("$comm($bytes_fmt)")
+                log_msg "DRY-RUN" "Would send $signal to $comm (PID $pid, writing $rate_fmt)"
+                killed_names+=("$comm@$rate_fmt")
                 [[ "$track_for_resume" == "true" ]] && record_paused_pid "$pid" "$comm"
             else
                 if kill "$signal" "$pid" 2>/dev/null; then
-                    log_msg "ACTION" "Sent $signal to $comm (PID $pid, wrote $bytes_fmt)"
-                    killed_names+=("$comm($bytes_fmt)")
+                    log_msg "ACTION" "Sent $signal to $comm (PID $pid, writing $rate_fmt)"
+                    killed_names+=("$comm@$rate_fmt")
                     [[ "$track_for_resume" == "true" ]] && record_paused_pid "$pid" "$comm"
                     (( killed++ ))
                 fi
             fi
+        done < <(get_write_rates 1)
 
-            (( killed >= max_count )) && break
-        done < <(get_heavy_writers)
+        # If no active writers found by rate, fall back to cumulative totals
+        # (catches processes that write in bursts)
+        if (( killed == 0 && ${#killed_names[@]} == 0 )); then
+            while IFS=: read -r bytes pid comm; do
+                [[ -z "$pid" ]] && continue
+
+                local bytes_fmt
+                bytes_fmt=$(format_bytes "$bytes")
+
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    log_msg "DRY-RUN" "Would send $signal to $comm (PID $pid, wrote $bytes_fmt total)"
+                    killed_names+=("$comm($bytes_fmt)")
+                    [[ "$track_for_resume" == "true" ]] && record_paused_pid "$pid" "$comm"
+                else
+                    if kill "$signal" "$pid" 2>/dev/null; then
+                        log_msg "ACTION" "Sent $signal to $comm (PID $pid, wrote $bytes_fmt total)"
+                        killed_names+=("$comm($bytes_fmt)")
+                        [[ "$track_for_resume" == "true" ]] && record_paused_pid "$pid" "$comm"
+                        (( killed++ ))
+                    fi
+                fi
+                # Fallback limited to top 10 to avoid runaway
+                (( killed >= 10 )) && break
+            done < <(get_heavy_writers)
+        fi
     else
-        # Fallback: use predefined patterns
+        # Fallback: use predefined patterns (no limit - get all matching)
         local pids
         if [[ -n "$TARGET_USER" ]]; then
             pids=$(pgrep -u "$TARGET_USER" -f "$PROC_PATTERNS" 2>/dev/null)
@@ -1056,8 +1107,6 @@ kill_heavy_writers() {
                     (( killed++ ))
                 fi
             fi
-
-            (( killed >= max_count )) && break
         done
     fi
 
@@ -1072,16 +1121,18 @@ kill_heavy_writers() {
 
 action_kill() {
     local free="$1"
-    log_msg "EMERGENCY" "${free}GB free - sending SIGKILL"
+    local free_fmt
+    free_fmt=$(format_free_space "$free")
+    log_msg "EMERGENCY" "${free_fmt} free - sending SIGKILL"
 
     local killed
-    killed=$(kill_heavy_writers "-KILL" 10)
+    killed=$(kill_heavy_writers "-KILL")
 
     local msg
     if [[ -n "$killed" ]]; then
-        msg="${free}GB free! KILLED: $killed"
+        msg="${free_fmt} free! KILLED: $killed"
     else
-        msg="${free}GB free! No heavy writers found to kill."
+        msg="${free_fmt} free! No heavy writers found to kill."
     fi
 
     notify_desktop "critical" "DISK EMERGENCY" "$msg"
@@ -1092,13 +1143,15 @@ action_kill() {
 
 action_stop() {
     local free="$1"
-    log_msg "CRITICAL" "${free}GB free - sending SIGTERM"
+    local free_fmt
+    free_fmt=$(format_free_space "$free")
+    log_msg "CRITICAL" "${free_fmt} free - sending SIGTERM"
 
     local stopped
-    stopped=$(kill_heavy_writers "-TERM" 5)
+    stopped=$(kill_heavy_writers "-TERM")
 
     if [[ -n "$stopped" ]]; then
-        local msg="${free}GB free! Stopped: $stopped"
+        local msg="${free_fmt} free! Stopped: $stopped"
         notify_desktop "critical" "DISK CRITICAL" "$msg"
         notify_wall "DISK CRITICAL: $msg"
         notify_email "[CRITICAL] Disk Space Low - Processes Stopped" "disk-watchdog critical on $(hostname):\n\n$msg\n\nMount: $MOUNT_POINT\nTime: $(date)"
@@ -1108,21 +1161,23 @@ action_stop() {
 
 action_pause() {
     local free="$1"
-    log_msg "WARNING" "${free}GB free - sending SIGSTOP (pause)"
+    local free_fmt
+    free_fmt=$(format_free_space "$free")
+    log_msg "WARNING" "${free_fmt} free - sending SIGSTOP (pause)"
 
     local paused
     # Pass true to track_for_resume so we can auto-resume these later
-    paused=$(kill_heavy_writers "-STOP" 5 true)
+    paused=$(kill_heavy_writers "-STOP" true)
 
     if [[ -n "$paused" ]]; then
         local resume_hint
         if [[ "$AUTO_RESUME" == "true" ]]; then
-            resume_hint="Will auto-resume when disk recovers to ${RESUME_THRESH}GB+"
+            resume_hint="Will auto-resume at >${RESUME_THRESH}GB"
         else
             resume_hint="Resume with: kill -CONT <PID>"
             [[ -n "$TARGET_USER" ]] && resume_hint="Resume with: pkill -CONT -u $TARGET_USER"
         fi
-        local msg="${free}GB free! PAUSED: $paused"
+        local msg="${free_fmt} free! PAUSED: $paused"
         notify_desktop "critical" "DISK LOW" "$msg - $resume_hint"
         notify_wall "DISK LOW: $msg - $resume_hint"
         notify_email "[WARNING] Disk Space Low - Processes Paused" "disk-watchdog warning on $(hostname):\n\n$msg\n\n$resume_hint\n\nMount: $MOUNT_POINT\nTime: $(date)"
@@ -1135,7 +1190,9 @@ action_harsh_warn() {
     local rate="$2"
 
     if can_notify "harsh"; then
-        log_msg "WARNING" "${free}GB free"
+        local free_fmt
+        free_fmt=$(format_free_space "$free")
+        log_msg "WARNING" "${free_fmt} free"
 
         local rate_info=""
         (( rate > 0 )) && rate_info="Filling at ~${rate}GB/min!\n"
@@ -1158,7 +1215,7 @@ action_harsh_warn() {
         fi
 
         # Detailed message for desktop
-        local desktop_msg="${free}GB free on $MOUNT_POINT\n${rate_info}"
+        local desktop_msg="${free_fmt} free on $MOUNT_POINT\n${rate_info}"
         if [[ -n "$desktop_writers" ]]; then
             desktop_msg+="Active writers:\n${desktop_writers}"
         else
@@ -1167,11 +1224,11 @@ action_harsh_warn() {
         desktop_msg+="Run: disk-watchdog status"
 
         # Short message for phone/webhook
-        local short_msg="${free}GB free. ${rate_info}${short_writer}"
+        local short_msg="${free_fmt} free. ${rate_info}${short_writer}"
 
         notify_desktop "critical" "Disk Space Low" "$desktop_msg"
-        notify_wall "DISK WARNING: ${free}GB free.${rate_info:+ $rate_info}${short_writer:+ $short_writer}"
-        notify_email "[WARNING] Disk Space Getting Low" "disk-watchdog warning on $(hostname):\n\n${free}GB free\n${rate_info}\n${desktop_writers}\nMount: $MOUNT_POINT\nTime: $(date)\n\nNo action taken yet - this is an early warning."
+        notify_wall "DISK WARNING: ${free_fmt} free.${rate_info:+ $rate_info}${short_writer:+ $short_writer}"
+        notify_email "[WARNING] Disk Space Getting Low" "disk-watchdog warning on $(hostname):\n\n${free_fmt} free\n${rate_info}\n${desktop_writers}\nMount: $MOUNT_POINT\nTime: $(date)\n\nNo action taken yet - this is an early warning."
         notify_webhook "Disk Space Low" "$short_msg"
     fi
 }
@@ -1180,15 +1237,19 @@ action_warn() {
     local free="$1"
 
     if can_notify "warn"; then
-        log_msg "NOTICE" "${free}GB free"
-        notify_desktop "normal" "Disk Space Notice" "${free}GB free on $MOUNT_POINT"
+        local free_fmt
+        free_fmt=$(format_free_space "$free")
+        log_msg "NOTICE" "${free_fmt} free"
+        notify_desktop "normal" "Disk Space Notice" "${free_fmt} free on $MOUNT_POINT"
     fi
 }
 
 action_recover() {
     local free="$1"
-    log_msg "INFO" "Recovered to ${free}GB free"
-    notify_desktop "normal" "Disk Space OK" "Recovered to ${free}GB free"
+    local free_fmt
+    free_fmt=$(format_free_space "$free")
+    log_msg "INFO" "Recovered to ${free_fmt} free"
+    notify_desktop "normal" "Disk Space OK" "Recovered to ${free_fmt} free"
 
     # Clear notification cooldowns
     rm -f "${STATE_DIR}"/notify_* 2>/dev/null || true
