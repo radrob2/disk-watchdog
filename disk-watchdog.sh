@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-readonly VERSION="1.3.0"
+readonly VERSION="1.3.1"
 readonly SCRIPT_NAME="disk-watchdog"
 
 # =============================================================================
@@ -80,6 +80,11 @@ BIOTOP_THRESHOLD_KB="${DISK_WATCHDOG_BIOTOP_THRESHOLD:-1024}"
 # Default: 1MB/s - any process writing faster than this is considered problematic
 # All processes above this rate are targeted, not just "top N"
 ACTION_WRITE_RATE_THRESHOLD="${DISK_WATCHDOG_ACTION_RATE:-1048576}"
+
+# Assumed maximum write speed (GB/s) for calculating safe check intervals
+# Used to ensure we check frequently enough on small disks with fast storage
+# Default: 7 GB/s (7000 MB/s) - covers fastest PCIe 4.0/5.0 NVMe SSDs
+ASSUMED_MAX_WRITE_SPEED="${DISK_WATCHDOG_MAX_WRITE_SPEED:-7}"
 
 # Fallback process patterns if smart mode fails
 PROC_PATTERNS="${DISK_WATCHDOG_PROCS:-fastp|kraken|dustmasker|bwa|spades|megahit|rsync|photorec|dd|cp|mv}"
@@ -441,16 +446,60 @@ get_free_bytes() {
 
 get_check_interval() {
     local free="$1"
-    # Adaptive intervals: more frequent as disk fills up
-    # At critical levels, check very frequently to catch rapid filling
-    if   (( free > THRESH_NOTICE )); then echo 300   # 5 min - all good
-    elif (( free > THRESH_WARN ));   then echo 60    # 1 min - getting lower
-    elif (( free > THRESH_HARSH ));  then echo 30    # 30 sec - warning zone
-    elif (( free > THRESH_PAUSE ));  then echo 10    # 10 sec - danger zone
-    elif (( free > THRESH_STOP ));   then echo 3     # 3 sec - critical
-    elif (( free > THRESH_KILL ));   then echo 1     # 1 sec - emergency
-    else                                  echo 1     # 1 sec - extreme emergency
+
+    # Dynamic intervals based on buffer to next threshold
+    # Ensures we check frequently enough even on small disks with fast storage
+    # Formula: interval = buffer / max_write_speed / safety_factor
+    # With min/max bounds per level to avoid too slow or too frequent checks
+
+    local buffer next_thresh min_interval max_interval safe_interval
+
+    if (( free > THRESH_NOTICE )); then
+        # OK level - no immediate concern
+        buffer=$(( free - THRESH_NOTICE ))
+        min_interval=60    # At least 1 min
+        max_interval=300   # At most 5 min
+    elif (( free > THRESH_WARN )); then
+        # Notice level
+        buffer=$(( free - THRESH_WARN ))
+        min_interval=30
+        max_interval=60
+    elif (( free > THRESH_HARSH )); then
+        # Warn level
+        buffer=$(( free - THRESH_HARSH ))
+        min_interval=10
+        max_interval=30
+    elif (( free > THRESH_PAUSE )); then
+        # Harsh level - getting serious
+        buffer=$(( free - THRESH_PAUSE ))
+        min_interval=3
+        max_interval=10
+    elif (( free > THRESH_STOP )); then
+        # Pause level - critical
+        buffer=$(( free - THRESH_STOP ))
+        min_interval=1
+        max_interval=3
+    elif (( free > THRESH_KILL )); then
+        # Stop level - emergency
+        buffer=$(( free - THRESH_KILL ))
+        min_interval=1
+        max_interval=1
+    else
+        # Kill level - extreme emergency
+        echo 1
+        return
     fi
+
+    # Calculate safe interval: buffer(GB) / speed(GB/s) / safety_factor(2)
+    # Using awk for floating point math
+    safe_interval=$(awk -v buf="$buffer" -v speed="$ASSUMED_MAX_WRITE_SPEED" \
+        'BEGIN { printf "%d", buf / speed / 2 }')
+
+    # Apply bounds
+    (( safe_interval < min_interval )) && safe_interval=$min_interval
+    (( safe_interval > max_interval )) && safe_interval=$max_interval
+
+    echo "$safe_interval"
 }
 
 get_level() {
