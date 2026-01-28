@@ -349,7 +349,37 @@ if [[ ! -f /etc/disk-watchdog.conf ]]; then
             fi
         else
             info "Push notifications skipped"
-            info "You can enable later in /etc/disk-watchdog.conf"
+        fi
+
+        # --- Email Notifications ---
+        subheader "Email notifications?"
+        echo ""
+        echo -e "  ${DIM}Get alerts via email (requires mail/sendmail/msmtp)${NC}"
+        echo ""
+        echo -e "    ${CYAN}y${NC})  Yes, set up email notifications"
+        echo -e "    ${CYAN}n${NC})  No, skip this ${DIM}(press Enter)${NC}"
+        echo ""
+        read -p "  Enable email notifications? [y/N]: " enable_email
+
+        if [[ "$enable_email" =~ ^[Yy] ]]; then
+            read -p "  Enter your email address: " email_addr
+            if [[ -n "$email_addr" && "$email_addr" == *@* ]]; then
+                sed -i "s|^DISK_WATCHDOG_EMAIL=.*|DISK_WATCHDOG_EMAIL=true|" /etc/disk-watchdog.conf
+                sed -i "s|^# DISK_WATCHDOG_EMAIL_TO=.*|DISK_WATCHDOG_EMAIL_TO=$email_addr|" /etc/disk-watchdog.conf
+
+                # Check if mail command exists
+                if command -v mail &>/dev/null || command -v sendmail &>/dev/null || command -v msmtp &>/dev/null; then
+                    success "Email notifications enabled → $email_addr"
+                else
+                    success "Email configured → $email_addr"
+                    echo -e "  ${YELLOW}⚠${NC}  ${DIM}No mail command found. Install mailutils, sendmail, or msmtp.${NC}"
+                fi
+                [[ "$CONFIG_NOTIFY" == "none" ]] && CONFIG_NOTIFY="email" || CONFIG_NOTIFY+=", email"
+            else
+                error "Invalid email address, skipping"
+            fi
+        else
+            info "Email notifications skipped"
         fi
     else
         # Non-interactive: use defaults
